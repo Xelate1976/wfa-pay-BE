@@ -2,16 +2,21 @@
  * WFA Asia — payments backend
  * -----------------------------------------------------------------------
  * Minimal Express server that:
- *   1. Creates a Stripe PaymentIntent for a cart total (kept server-side —
- *      never expose your Stripe SECRET key to the browser).
- *   2. Verifies successful payments and fires WhatsApp (Twilio) + email
- *      (Resend) notifications. Two paths call notifyOnPayment():
- *        - /order-paid: called by the app right after the browser
- *          confirms the card payment (fast, but skipped if the guest
- *          closes the tab before this request finishes).
- *        - /webhook: Stripe calls this directly, so it's the reliable
- *          source of truth. Set this up in production; /order-paid is a
- *          nice-to-have for instant feedback.
+ *   1. Creates a Stripe Checkout Session for a cart total and hands back
+ *      its hosted URL. The app opens that URL in a new browser tab —
+ *      Stripe's own page collects the card, so no card-handling code or
+ *      script ever needs to load inside the ordering app itself.
+ *   2. Lets the app poll a session's status after opening it (since the
+ *      payment happens in a separate tab, there's no direct callback).
+ *   3. Verifies successful payments and fires WhatsApp (Twilio) + email
+ *      (Resend) notifications, via two paths that both call
+ *      notifyOnPayment():
+ *        - the webhook below (checkout.session.completed) — the
+ *          reliable source of truth, fires even if the guest never
+ *          returns to the ordering tab.
+ *        - /order-paid — a convenience call the app makes once it sees
+ *          (via polling) that the session succeeded, for instant
+ *          feedback without waiting on the webhook round trip.
  *
  * This file is a starting point, not a finished production server —
  * see README.md for what to change before going live.
@@ -31,8 +36,9 @@ app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 
 /* ---------------------------------------------------------------------
    Stripe webhook — must read the RAW body, so this is mounted before
-   express.json(). Register this URL + these events in the Stripe
-   dashboard (or `stripe listen` for local testing). See README.
+   express.json(). Register this URL + the checkout.session.completed
+   event in the Stripe dashboard (or `stripe listen` for local testing).
+   See README.
 --------------------------------------------------------------------- */
 app.post(
   "/webhook",
@@ -50,8 +56,9 @@ app.post(
       return res.sendStatus(400);
     }
 
-    if (event.type === "payment_intent.succeeded") {
-      await notifyOnPayment(event.data.object);
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+      await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
     }
     res.json({ received: true });
   }
@@ -60,10 +67,12 @@ app.post(
 app.use(express.json());
 
 /* ---------------------------------------------------------------------
-   1. Create a PaymentIntent for the current cart total.
-   Called by the app before it shows the card form.
+   1. Create a Checkout Session for the current cart total, and return
+   its hosted URL. The app opens this URL in a new tab (window.open) —
+   that's just a normal navigation, not a script load, so it works even
+   in sandboxes that block loading third-party JS (like Claude artifacts).
 --------------------------------------------------------------------- */
-app.post("/create-payment-intent", async (req, res) => {
+app.post("/create-checkout-session", async (req, res) => {
   try {
     const { amount, currency = "sgd", table, customer, items } = req.body;
 
@@ -71,10 +80,25 @@ app.post("/create-payment-intent", async (req, res) => {
       return res.status(400).json({ error: "Invalid amount (must be integer cents, min 50)." });
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount, // cents — the app converts dollars -> cents before calling this
-      currency,
-      receipt_email: customer?.email,
+    const origin = req.headers.origin || `${req.protocol}://${req.get("host")}`;
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "payment",
+      payment_method_types: ["card"],
+      customer_email: customer?.email,
+      line_items: [
+        {
+          price_data: {
+            currency,
+            product_data: {
+              name: `WFA Asia order${table ? ` — Table ${table}` : ""}`,
+              description: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500) || undefined,
+            },
+            unit_amount: amount,
+          },
+          quantity: 1,
+        },
+      ],
       metadata: {
         table: table ? String(table) : "",
         customerName: customer?.name || "",
@@ -82,31 +106,51 @@ app.post("/create-payment-intent", async (req, res) => {
         customerPhone: customer?.phone || "",
         items: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
       },
+      success_url: `${process.env.PUBLIC_URL || origin}/checkout-success`,
+      cancel_url: `${process.env.PUBLIC_URL || origin}/checkout-cancel`,
     });
 
-    res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+    res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
-    console.error("create-payment-intent failed:", err.message);
+    console.error("create-checkout-session failed:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
 /* ---------------------------------------------------------------------
-   2. Convenience confirmation — called by the app right after Stripe.js
-   confirms the card payment client-side. We re-check status with Stripe
-   (never trust the client's word alone) before sending notifications.
+   2. Poll this to find out if a session has been paid yet. The app
+   calls it every couple of seconds after opening the Checkout tab.
+--------------------------------------------------------------------- */
+app.get("/checkout-session/:id", async (req, res) => {
+  try {
+    const session = await stripe.checkout.sessions.retrieve(req.params.id);
+    res.json({
+      status: session.payment_status, // "paid" | "unpaid" | "no_payment_required"
+      amountTotal: session.amount_total,
+      metadata: session.metadata,
+    });
+  } catch (err) {
+    console.error("checkout-session lookup failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/* ---------------------------------------------------------------------
+   3. Convenience confirmation — called by the app right after polling
+   shows a session is paid. We re-check with Stripe (never trust the
+   client's word alone) before sending notifications.
 --------------------------------------------------------------------- */
 app.post("/order-paid", async (req, res) => {
   try {
-    const { paymentIntentId } = req.body;
-    if (!paymentIntentId) return res.status(400).json({ error: "paymentIntentId required" });
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: "sessionId required" });
 
-    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-    if (pi.status !== "succeeded") {
-      return res.status(400).json({ error: `Payment not confirmed (status: ${pi.status})` });
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.payment_status !== "paid") {
+      return res.status(400).json({ error: `Payment not confirmed (status: ${session.payment_status})` });
     }
 
-    await notifyOnPayment(pi);
+    await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
     res.json({ ok: true });
   } catch (err) {
     console.error("order-paid failed:", err.message);
@@ -115,13 +159,33 @@ app.post("/order-paid", async (req, res) => {
 });
 
 /* ---------------------------------------------------------------------
+   Plain landing pages Stripe redirects the Checkout tab to. The guest
+   sees this in the tab Checkout opened in — they can close it and
+   return to the ordering tab, which is independently polling and will
+   pick up the confirmation on its own.
+--------------------------------------------------------------------- */
+app.get("/checkout-success", (_req, res) => {
+  res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:4rem 1rem;">
+    <h1>Payment received ✅</h1>
+    <p>You can close this tab and return to your order.</p>
+  </body></html>`);
+});
+
+app.get("/checkout-cancel", (_req, res) => {
+  res.send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:4rem 1rem;">
+    <h1>Payment cancelled</h1>
+    <p>No charge was made. You can close this tab and try again.</p>
+  </body></html>`);
+});
+
+/* ---------------------------------------------------------------------
    Notifications — fill in your real credentials in .env. Each block is
    independently optional: if the relevant env vars are missing, that
    channel is just skipped (logged, not thrown).
 --------------------------------------------------------------------- */
-async function notifyOnPayment(paymentIntent) {
-  const total = (paymentIntent.amount / 100).toFixed(2);
-  const { table, customerEmail, items } = paymentIntent.metadata || {};
+async function notifyOnPayment({ amountCents, metadata }) {
+  const total = (amountCents / 100).toFixed(2);
+  const { table, customerEmail, items } = metadata || {};
 
   // --- WhatsApp via Twilio ---------------------------------------------
   if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
