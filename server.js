@@ -64,10 +64,13 @@ app.post(
   }
 );
 
-// Default limit is 100kb — too small for menu photos sent as base64.
-// 12mb comfortably covers a typical phone photo; if you're seeing 413
-// "Payload Too Large" errors after this, raise it further.
-app.use(express.json({ limit: "12mb" }));
+// Default limit is 100kb. Menu photos need a few MB; banner video clips
+// need more — 25mb comfortably covers a short, small MP4. This is still
+// an in-memory server on a free tier with limited RAM, so this isn't
+// unlimited: keep video clips short and lightly compressed, and prefer
+// pasting a URL to externally-hosted video over uploading large files
+// directly when possible.
+app.use(express.json({ limit: "25mb" }));
 
 /* ---------------------------------------------------------------------
    1. Create a Checkout Session for the current cart total, and return
