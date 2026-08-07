@@ -280,6 +280,54 @@ app.post("/store/:key", (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------------------------------------------------------------------
+   Orders & notifications — dedicated endpoints, NOT the generic /store
+   above. Here's why: the generic store is "fetch it, change it, save
+   the whole thing back" — fine for the menu or table list (one person
+   edits at a time), but with orders, two devices placing an order
+   around the same moment would both fetch the same list, each add
+   their own order, and each save their own version back. Whichever
+   save happens last WINS — silently erasing the other guest's order.
+   That's the bug this fixes: the server does the "add one order" step
+   itself, in a single request, so two orders arriving close together
+   both survive no matter what order they arrive in.
+--------------------------------------------------------------------- */
+let ordersList = [];
+let notificationsList = [];
+
+app.get("/orders", (_req, res) => {
+  res.json({ orders: ordersList });
+});
+
+app.post("/orders", (req, res) => {
+  const { order } = req.body;
+  if (!order || !order.id) return res.status(400).json({ error: "order required" });
+  ordersList = [order, ...ordersList];
+  res.json({ ok: true, count: ordersList.length });
+});
+
+// Only used once, to load the initial 90 days of demo history — guarded
+// so it can't accidentally wipe real orders that have already come in.
+app.post("/orders/seed", (req, res) => {
+  const { orders } = req.body;
+  if (ordersList.length > 0) {
+    return res.json({ ok: false, reason: "orders already exist, seed skipped", count: ordersList.length });
+  }
+  ordersList = Array.isArray(orders) ? orders : [];
+  res.json({ ok: true, count: ordersList.length });
+});
+
+app.get("/notifications", (_req, res) => {
+  res.json({ notifications: notificationsList });
+});
+
+app.post("/notifications", (req, res) => {
+  const { items } = req.body;
+  if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
+  notificationsList = [...items, ...notificationsList].slice(0, 40);
+  res.json({ ok: true });
+});
+
 
 const port = process.env.PORT || 4000;
 app.listen(port, () => console.log(`WFA payments backend listening on :${port}`));
