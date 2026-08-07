@@ -254,5 +254,32 @@ async function notifyOnPayment({ amountCents, metadata }) {
 
 app.get("/", (_req, res) => res.send("WFA Asia payments backend is running."));
 
+/* ---------------------------------------------------------------------
+   Shared store — orders, the menu, and the table list all live here now
+   instead of in each browser's own localStorage, so a guest's phone and
+   the merchant's dashboard device actually see the same data.
+
+   ⚠️ This is in-memory only — it resets whenever this server restarts
+   (Render's free tier does this after ~15 min of inactivity, and on
+   every redeploy). That's fine for a prototype, but before relying on
+   this for a real service night after night, swap this for a real
+   database (e.g. Postgres) so data survives restarts. Happy to build
+   that when you're ready — it's a bigger, deliberate step up, not
+   something to do accidentally.
+--------------------------------------------------------------------- */
+const store = {};
+
+app.get("/store/:key", (req, res) => {
+  const entry = store[req.params.key];
+  if (entry === undefined) return res.status(404).json({ error: "not found" });
+  res.json({ value: entry });
+});
+
+app.post("/store/:key", (req, res) => {
+  store[req.params.key] = req.body.value;
+  res.json({ ok: true });
+});
+
+
 const port = process.env.PORT || 4000;
 app.listen(port, () => console.log(`WFA payments backend listening on :${port}`));
