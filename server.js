@@ -74,13 +74,26 @@ app.use(express.json());
 --------------------------------------------------------------------- */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, currency = "sgd", table, customer, items } = req.body;
+    const { amount, currency = "sgd", table, customer, items, returnUrl } = req.body;
 
     if (!Number.isInteger(amount) || amount < 50) {
       return res.status(400).json({ error: "Invalid amount (must be integer cents, min 50)." });
     }
+    if (!returnUrl) {
+      return res.status(400).json({ error: "returnUrl is required (the ordering app's own URL)." });
+    }
 
-    const origin = req.headers.origin || `${req.protocol}://${req.get("host")}`;
+    // Bug fixed: this used to send guests to a static "you can close this
+    // tab" page on the backend and rely on the ORIGINAL tab silently
+    // polling in the background to notice payment succeeded. That's
+    // fragile on mobile (background tabs get throttled/killed) and,
+    // worse, never actually brings the guest back automatically. Stripe's
+    // own recommended pattern is simpler and more reliable: redirect in
+    // the SAME tab, back to the app's own URL, with the session id
+    // attached — the app checks for that on load and shows the receipt.
+    // {CHECKOUT_SESSION_ID} is a literal placeholder Stripe fills in.
+    const successUrl = `${returnUrl}?session_id={CHECKOUT_SESSION_ID}&paid=1`;
+    const cancelUrl = `${returnUrl}?paid=0`;
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
@@ -106,8 +119,8 @@ app.post("/create-checkout-session", async (req, res) => {
         customerPhone: customer?.phone || "",
         items: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
       },
-      success_url: `${process.env.PUBLIC_URL || origin}/checkout-success`,
-      cancel_url: `${process.env.PUBLIC_URL || origin}/checkout-cancel`,
+      success_url: successUrl,
+      cancel_url: cancelUrl,
     });
 
     res.json({ url: session.url, sessionId: session.id });
