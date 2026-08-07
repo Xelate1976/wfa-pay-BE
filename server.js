@@ -26,11 +26,42 @@ import express from "express";
 import cors from "cors";
 import Stripe from "stripe";
 import dotenv from "dotenv";
+import admin from "firebase-admin";
 
 dotenv.config();
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
+
+/* ---------------------------------------------------------------------
+   Firestore — this is the real persistent store. Orders, the menu,
+   tables, outlets, and banners all live here now, so they survive a
+   server restart (Render's free tier restarts after ~15 min idle, and
+   on every redeploy — that used to mean losing everything).
+
+   If GOOGLE_SERVICE_ACCOUNT_JSON isn't set, every storage function
+   below falls back to the old in-memory behavior automatically, so
+   this file still runs fine before you've set Firestore up — it just
+   won't persist anything until you do.
+--------------------------------------------------------------------- */
+let db = null;
+if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+  try {
+    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    db = admin.firestore();
+    console.log("Firestore connected — data will persist across restarts.");
+  } catch (e) {
+    console.error("Failed to initialize Firestore (check GOOGLE_SERVICE_ACCOUNT_JSON) — falling back to in-memory store:", e.message);
+  }
+} else {
+  console.log("[notice] GOOGLE_SERVICE_ACCOUNT_JSON not set — using in-memory store (data resets on restart).");
+}
+
+// Only used as a fallback when Firestore isn't configured.
+const memStore = {};
+let memOrders = [];
+let memNotifications = [];
 
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
 
@@ -261,28 +292,40 @@ async function notifyOnPayment({ amountCents, metadata }) {
 app.get("/", (_req, res) => res.send("WFA Asia payments backend is running."));
 
 /* ---------------------------------------------------------------------
-   Shared store — orders, the menu, and the table list all live here now
-   instead of in each browser's own localStorage, so a guest's phone and
-   the merchant's dashboard device actually see the same data.
-
-   ⚠️ This is in-memory only — it resets whenever this server restarts
-   (Render's free tier does this after ~15 min of inactivity, and on
-   every redeploy). That's fine for a prototype, but before relying on
-   this for a real service night after night, swap this for a real
-   database (e.g. Postgres) so data survives restarts. Happy to build
-   that when you're ready — it's a bigger, deliberate step up, not
-   something to do accidentally.
+   Generic shared store — the menu, table list, outlets, and banners all
+   live here (each under their own key). Backed by Firestore when
+   configured (see the note near the top of this file); falls back to
+   plain in-memory otherwise.
 --------------------------------------------------------------------- */
-const store = {};
-
-app.get("/store/:key", (req, res) => {
-  const entry = store[req.params.key];
+app.get("/store/:key", async (req, res) => {
+  const key = req.params.key;
+  if (db) {
+    try {
+      const doc = await db.collection("kv").doc(key).get();
+      if (!doc.exists) return res.status(404).json({ error: "not found" });
+      return res.json({ value: doc.data().value });
+    } catch (e) {
+      console.error("Firestore get failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  const entry = memStore[key];
   if (entry === undefined) return res.status(404).json({ error: "not found" });
   res.json({ value: entry });
 });
 
-app.post("/store/:key", (req, res) => {
-  store[req.params.key] = req.body.value;
+app.post("/store/:key", async (req, res) => {
+  const key = req.params.key;
+  if (db) {
+    try {
+      await db.collection("kv").doc(key).set({ value: req.body.value });
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("Firestore set failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  memStore[key] = req.body.value;
   res.json({ ok: true });
 });
 
@@ -294,46 +337,104 @@ app.post("/store/:key", (req, res) => {
    around the same moment would both fetch the same list, each add
    their own order, and each save their own version back. Whichever
    save happens last WINS — silently erasing the other guest's order.
-   That's the bug this fixes: the server does the "add one order" step
-   itself, in a single request, so two orders arriving close together
-   both survive no matter what order they arrive in.
+   These endpoints avoid that: each order is its own Firestore document
+   (or, without Firestore, the server appends to its own in-memory list
+   in a single synchronous step) — either way, two orders arriving
+   close together both survive no matter which one's request finishes
+   first.
 --------------------------------------------------------------------- */
-let ordersList = [];
-let notificationsList = [];
-
-app.get("/orders", (_req, res) => {
-  res.json({ orders: ordersList });
+app.get("/orders", async (_req, res) => {
+  if (db) {
+    try {
+      const snap = await db.collection("orders").orderBy("ts", "desc").limit(1000).get();
+      return res.json({ orders: snap.docs.map((d) => d.data()) });
+    } catch (e) {
+      console.error("Firestore orders fetch failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  res.json({ orders: memOrders });
 });
 
-app.post("/orders", (req, res) => {
+app.post("/orders", async (req, res) => {
   const { order } = req.body;
   if (!order || !order.id) return res.status(400).json({ error: "order required" });
-  ordersList = [order, ...ordersList];
-  res.json({ ok: true, count: ordersList.length });
+  if (db) {
+    try {
+      await db.collection("orders").doc(order.id).set(order);
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("Firestore order write failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  memOrders = [order, ...memOrders];
+  res.json({ ok: true, count: memOrders.length });
 });
 
 // Only used once, to load the initial 90 days of demo history — guarded
-// so it can't accidentally wipe real orders that have already come in.
-app.post("/orders/seed", (req, res) => {
+// so it can't accidentally wipe real orders that have already come in,
+// and so two devices loading for the first time at once don't both seed.
+app.post("/orders/seed", async (req, res) => {
   const { orders } = req.body;
-  if (ordersList.length > 0) {
-    return res.json({ ok: false, reason: "orders already exist, seed skipped", count: ordersList.length });
+  const toSeed = Array.isArray(orders) ? orders : [];
+
+  if (db) {
+    try {
+      const existing = await db.collection("orders").limit(1).get();
+      if (!existing.empty) {
+        return res.json({ ok: false, reason: "orders already exist, seed skipped" });
+      }
+      // Firestore batches cap at 500 writes, so chunk larger seed sets.
+      for (let i = 0; i < toSeed.length; i += 450) {
+        const batch = db.batch();
+        toSeed.slice(i, i + 450).forEach((o) => batch.set(db.collection("orders").doc(o.id), o));
+        await batch.commit();
+      }
+      return res.json({ ok: true, count: toSeed.length });
+    } catch (e) {
+      console.error("Firestore seed failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
   }
-  ordersList = Array.isArray(orders) ? orders : [];
-  res.json({ ok: true, count: ordersList.length });
+
+  if (memOrders.length > 0) {
+    return res.json({ ok: false, reason: "orders already exist, seed skipped" });
+  }
+  memOrders = toSeed;
+  res.json({ ok: true, count: memOrders.length });
 });
 
-app.get("/notifications", (_req, res) => {
-  res.json({ notifications: notificationsList });
+app.get("/notifications", async (_req, res) => {
+  if (db) {
+    try {
+      const snap = await db.collection("notifications").orderBy("ts", "desc").limit(40).get();
+      return res.json({ notifications: snap.docs.map((d) => d.data()) });
+    } catch (e) {
+      console.error("Firestore notifications fetch failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  res.json({ notifications: memNotifications });
 });
 
-app.post("/notifications", (req, res) => {
+app.post("/notifications", async (req, res) => {
   const { items } = req.body;
   if (!Array.isArray(items)) return res.status(400).json({ error: "items array required" });
-  notificationsList = [...items, ...notificationsList].slice(0, 40);
+  if (db) {
+    try {
+      const batch = db.batch();
+      items.forEach((item) => batch.set(db.collection("notifications").doc(), item));
+      await batch.commit();
+      return res.json({ ok: true });
+    } catch (e) {
+      console.error("Firestore notifications write failed:", e.message);
+      return res.status(500).json({ error: e.message });
+    }
+  }
+  memNotifications = [...items, ...memNotifications].slice(0, 40);
   res.json({ ok: true });
 });
-
 
 const port = process.env.PORT || 4000;
 app.listen(port, () => console.log(`WFA payments backend listening on :${port}`));
