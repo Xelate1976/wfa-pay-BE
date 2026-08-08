@@ -8,8 +8,8 @@
  *      script ever needs to load inside the ordering app itself.
  *   2. Lets the app poll a session's status after opening it (since the
  *      payment happens in a separate tab, there's no direct callback).
- *   3. Verifies successful payments and fires WhatsApp (Twilio) + email
- *      (Resend) notifications, via two paths that both call
+ *   3. Verifies successful payments and fires WhatsApp (Green-API) +
+ *      email (Resend) notifications, via two paths that both call
  *      notifyOnPayment():
  *        - the webhook below (checkout.session.completed) — the
  *          reliable source of truth, fires even if the guest never
@@ -246,6 +246,7 @@ app.post("/create-checkout-session", async (req, res) => {
       ],
       metadata: {
         table: table ? String(table) : "",
+        outlet: outlet ? String(outlet) : "",
         customerName: customer?.name || "",
         customerEmail: customer?.email || "",
         customerPhone: customer?.phone || "",
@@ -359,40 +360,139 @@ app.get("/checkout-cancel", (_req, res) => {
 });
 
 /* ---------------------------------------------------------------------
+   WhatsApp via Green-API — wraps a WhatsApp Web session in a plain REST
+   API. No Meta Business verification or template approval needed, so
+   it's fast to set up. Trade-off: it's not the official WhatsApp
+   Business Platform, so it's best suited to low-volume, internal use
+   (alerting a single merchant/supplier number), not bulk customer-
+   facing messaging.
+
+   Each OUTLET has its own Green-API instance/number (see outletSecrets
+   below), so credentials are passed in as arguments here rather than
+   read from process.env directly — that's just the shared fallback,
+   used only if an outlet hasn't configured its own yet.
+
+   `toNumber` must be international format, digits only, no "+" and no
+   spaces (e.g. "6591234567").
+--------------------------------------------------------------------- */
+async function sendWhatsAppViaGreenAPI(instanceId, apiToken, toNumber, text) {
+  if (!instanceId || !apiToken || !toNumber) return;
+  try {
+    const url = `https://api.green-api.com/waInstance${instanceId}/sendMessage/${apiToken}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chatId: `${toNumber}@c.us`,
+        message: text,
+      }),
+    });
+    if (!res.ok) {
+      console.error(`Green-API WhatsApp send failed (${res.status}):`, await res.text());
+    }
+  } catch (e) {
+    console.error("Green-API WhatsApp send failed:", e.message);
+  }
+}
+
+/* ---------------------------------------------------------------------
+   Per-outlet WhatsApp credentials — stored in their OWN Firestore
+   collection (outletSecrets), never in the public "wfa-outlets"
+   document that the customer ordering page fetches. Mixing secrets
+   into a document the customer app reads would leak Green-API tokens
+   to anyone with browser dev tools open.
+
+   Protected by a shared admin key (ADMIN_API_KEY env var) checked via
+   the x-admin-key header — the merchant dashboard needs to send this
+   header on every request to these two endpoints. If ADMIN_API_KEY
+   isn't set at all, the check is skipped (convenient for local dev,
+   but set it before going live).
+--------------------------------------------------------------------- */
+function requireAdminKey(req, res, next) {
+  if (!process.env.ADMIN_API_KEY) return next();
+  if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+app.get("/outlet-secrets/:outletId", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured" });
+  try {
+    const doc = await db.collection("outletSecrets").doc(req.params.outletId).get();
+    res.json({ value: doc.exists ? doc.data() : {} });
+  } catch (e) {
+    console.error("outlet-secrets get failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.post("/outlet-secrets/:outletId", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured" });
+  try {
+    await db.collection("outletSecrets").doc(req.params.outletId).set(req.body.value || {}, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("outlet-secrets set failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* ---------------------------------------------------------------------
    Notifications — fill in your real credentials in .env. Each block is
    independently optional: if the relevant env vars are missing, that
    channel is just skipped (logged, not thrown).
 --------------------------------------------------------------------- */
 async function notifyOnPayment({ amountCents, metadata }) {
   const total = (amountCents / 100).toFixed(2);
-  const { table, customerEmail, items } = metadata || {};
+  const { table, customerEmail, items, outlet } = metadata || {};
 
-  // --- WhatsApp via Twilio ---------------------------------------------
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+  // Start with the shared fallback credentials (old single-account
+  // setup), then override with this outlet's own if it has any saved
+  // in outletSecrets. This means outlets that haven't been configured
+  // yet keep working off the shared account, while configured outlets
+  // use their own number automatically — no code change needed per
+  // outlet, just a dashboard entry.
+  let waInstanceId = process.env.GREENAPI_INSTANCE_ID;
+  let waApiToken = process.env.GREENAPI_API_TOKEN;
+  let merchantNumber = process.env.MERCHANT_WHATSAPP_NUMBER;
+  let supplierNumber = process.env.SUPPLIER_WHATSAPP_NUMBER;
+
+  if (db && outlet) {
     try {
-      const { default: twilioLib } = await import("twilio");
-      const client = twilioLib(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-      const from = `whatsapp:${process.env.TWILIO_WHATSAPP_FROM}`;
-
-      if (process.env.MERCHANT_WHATSAPP_NUMBER) {
-        await client.messages.create({
-          from,
-          to: `whatsapp:${process.env.MERCHANT_WHATSAPP_NUMBER}`,
-          body: `New order paid${table ? ` — Table ${table}` : ""} — $${total}\n${items || ""}`,
-        });
-      }
-      if (process.env.SUPPLIER_WHATSAPP_NUMBER) {
-        await client.messages.create({
-          from,
-          to: `whatsapp:${process.env.SUPPLIER_WHATSAPP_NUMBER}`,
-          body: `Restock check: ${items || "(no item detail)"}`,
-        });
+      const secretDoc = await db.collection("outletSecrets").doc(outlet).get();
+      if (secretDoc.exists) {
+        const s = secretDoc.data();
+        waInstanceId = s.greenApiInstanceId || waInstanceId;
+        waApiToken = s.greenApiApiToken || waApiToken;
+        merchantNumber = s.notifyWhatsAppNumber || merchantNumber;
+        supplierNumber = s.supplierWhatsAppNumber || supplierNumber;
       }
     } catch (e) {
-      console.error("WhatsApp send failed:", e.message);
+      console.error(`Failed to load WhatsApp config for outlet "${outlet}", falling back to shared credentials:`, e.message);
+    }
+  }
+
+  // --- WhatsApp via Green-API ---------------------------------------------
+  if (waInstanceId && waApiToken) {
+    if (merchantNumber) {
+      await sendWhatsAppViaGreenAPI(
+        waInstanceId,
+        waApiToken,
+        merchantNumber,
+        `💰 New order paid${table ? ` — Table ${table}` : ""} — $${total}\n${items || ""}`
+      );
+    }
+    if (supplierNumber) {
+      await sendWhatsAppViaGreenAPI(
+        waInstanceId,
+        waApiToken,
+        supplierNumber,
+        `Restock check: ${items || "(no item detail)"}`
+      );
     }
   } else {
-    console.log("[skipped] WhatsApp not configured (TWILIO_* env vars missing)");
+    console.log(`[skipped] WhatsApp not configured for outlet "${outlet || "(none)"}" and no shared GREENAPI_* fallback set`);
   }
 
   // --- Email via Resend --------------------------------------------------
