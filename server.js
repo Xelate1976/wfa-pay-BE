@@ -38,8 +38,9 @@ const app = express();
 /* ---------------------------------------------------------------------
    Firestore — this is the real persistent store. Orders, the menu,
    tables, outlets, and banners all live here now, so they survive a
-   server restart (Render's free tier restarts after ~15 min idle, and
-   on every redeploy — that used to mean losing everything).
+   server restart. In-memory hosting (like Render's free tier) loses
+   everything on every restart/idle-spindown — on Cloud Run this
+   doesn't matter since Firestore is the real store either way.
 
    ⚠️ Database name matters: admin.firestore() with no arguments always
    connects to a database literally named "(default)" — but a database
@@ -52,42 +53,63 @@ const app = express();
    name is right). getFirestore(firebaseApp, FIRESTORE_DATABASE_ID)
    below targets the real one explicitly instead of guessing.
 
-   If GOOGLE_SERVICE_ACCOUNT_JSON isn't set, every storage function
-   below falls back to the old in-memory behavior automatically, so
-   this file still runs fine before you've set Firestore up — it just
-   won't persist anything until you do.
+   Two ways to authenticate, tried in this order:
+   1. Application Default Credentials — automatic on Cloud Run (and any
+      Google Cloud compute product), using whatever service account the
+      service itself runs as. No JSON key, no env var, nothing to
+      copy/paste or accidentally corrupt — just grant that service
+      account the right IAM roles (see README) and it works.
+   2. GOOGLE_SERVICE_ACCOUNT_JSON — a manually-created key, needed on
+      hosts that aren't part of Google Cloud (Render, local dev, etc.)
+      where ADC has nothing to automatically pick up.
+
+   If neither is available, every storage function below falls back to
+   plain in-memory behavior automatically, so this file still runs
+   fine before Firestore is set up — it just won't persist anything.
 --------------------------------------------------------------------- */
 let db = null;
 let bucket = null;
-if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
-  try {
-    const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    const firebaseApp = admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    // Set FIRESTORE_DATABASE_ID on Render if your database isn't named
-    // "wfa-data" — check console.cloud.google.com > Firestore > your
-    // database's actual ID.
-    const databaseId = process.env.FIRESTORE_DATABASE_ID || "wfa-data";
-    db = getFirestore(firebaseApp, databaseId);
-    console.log(`Firestore connected (database: "${databaseId}") — data will persist across restarts.`);
+let credentialSource = null; // for logging only — "ADC" or "explicit key"
+let explicitCredentials = null; // only set when using GOOGLE_SERVICE_ACCOUNT_JSON, needed again below for Storage
 
-    // Cloud Storage — for menu photos and ad banners (images/GIFs/video).
-    // Firestore caps every document at 1MiB, which a single photo or
-    // clip can exceed on its own — that's not something splitting data
-    // across more documents can fix. Real files need real file storage
-    // instead of being embedded as base64 text. Only enabled if
-    // GCS_BUCKET_NAME is set; see README for how to create the bucket.
-    if (process.env.GCS_BUCKET_NAME) {
-      const storage = new Storage({ credentials: serviceAccount, projectId: serviceAccount.project_id });
-      bucket = storage.bucket(process.env.GCS_BUCKET_NAME);
-      console.log(`Cloud Storage connected (bucket: "${process.env.GCS_BUCKET_NAME}").`);
-    } else {
-      console.log("[notice] GCS_BUCKET_NAME not set — uploads will keep failing once they exceed Firestore's 1MiB document limit.");
-    }
-  } catch (e) {
-    console.error("Failed to initialize Firestore (check GOOGLE_SERVICE_ACCOUNT_JSON) — falling back to in-memory store:", e.message);
+try {
+  let firebaseApp;
+  if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
+    explicitCredentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    firebaseApp = admin.initializeApp({ credential: admin.credential.cert(explicitCredentials) });
+    credentialSource = "explicit key";
+  } else {
+    // No explicit key provided — try ADC. On Cloud Run this just works;
+    // anywhere else (a laptop with no `gcloud auth` set up, Render,
+    // etc.) this throws, and we fall through to the in-memory fallback
+    // below rather than crashing the whole server.
+    firebaseApp = admin.initializeApp();
+    credentialSource = "ADC";
   }
-} else {
-  console.log("[notice] GOOGLE_SERVICE_ACCOUNT_JSON not set — using in-memory store (data resets on restart).");
+
+  // Set FIRESTORE_DATABASE_ID if your database isn't named "wfa-data" —
+  // check console.cloud.google.com > Firestore > your database's actual ID.
+  const databaseId = process.env.FIRESTORE_DATABASE_ID || "wfa-data";
+  db = getFirestore(firebaseApp, databaseId);
+  console.log(`Firestore connected via ${credentialSource} (database: "${databaseId}") — data will persist across restarts.`);
+
+  // Cloud Storage — for menu photos and ad banners (images/GIFs/video).
+  // Firestore caps every document at 1MiB, which a single photo or
+  // clip can exceed on its own — that's not something splitting data
+  // across more documents can fix. Real files need real file storage
+  // instead of being embedded as base64 text. Only enabled if
+  // GCS_BUCKET_NAME is set; see README for how to create the bucket.
+  if (process.env.GCS_BUCKET_NAME) {
+    const storage = explicitCredentials
+      ? new Storage({ credentials: explicitCredentials, projectId: explicitCredentials.project_id })
+      : new Storage(); // ADC again — picks up the same identity automatically
+    bucket = storage.bucket(process.env.GCS_BUCKET_NAME);
+    console.log(`Cloud Storage connected via ${credentialSource} (bucket: "${process.env.GCS_BUCKET_NAME}").`);
+  } else {
+    console.log("[notice] GCS_BUCKET_NAME not set — uploads will keep failing once they exceed Firestore's 1MiB document limit.");
+  }
+} catch (e) {
+  console.error("Failed to initialize Firestore/Storage — falling back to in-memory store:", e.message);
 }
 
 // Only used as a fallback when Firestore isn't configured.
@@ -96,6 +118,46 @@ let memOrders = [];
 let memNotifications = [];
 
 app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+
+// The reliable path: looks up what was saved at checkout-creation time
+// (see /create-checkout-session) and writes it into the real orders
+// collection, now confirmed paid. Uses the session id as the order's
+// document id — same id the guest's own browser would use if IT
+// successfully completes the return trip too, so having both paths
+// fire just harmlessly overwrites the same record rather than
+// creating a duplicate. Safe to call from both the webhook and
+// /order-paid; whichever runs first wins, the other is a no-op.
+async function recordOrderFromSession(session) {
+  if (!db) return;
+  try {
+    const pendingDoc = await db.collection("checkoutPending").doc(session.id).get();
+    if (!pendingDoc.exists) {
+      console.error(`recordOrderFromSession: no checkoutPending record for ${session.id} — order may only exist if the guest's browser completed the return trip.`);
+      return;
+    }
+    const p = pendingDoc.data();
+    const order = {
+      id: session.id,
+      ts: p.createdAt || new Date().toISOString(),
+      items: p.items || [],
+      total: +(session.amount_total / 100).toFixed(2),
+      subtotal: p.subtotal,
+      serviceCharge: p.serviceCharge,
+      gst: p.gst,
+      customer: p.customerName || "",
+      email: p.customerEmail || "",
+      phone: p.customerPhone || "",
+      outlet: p.outlet || null,
+      table: p.table || null,
+      sessionId: session.id,
+      live: true,
+    };
+    await db.collection("orders").doc(session.id).set(order);
+  } catch (e) {
+    console.error("recordOrderFromSession failed:", e.message);
+  }
+}
+
 
 /* ---------------------------------------------------------------------
    Stripe webhook — must read the RAW body, so this is mounted before
@@ -122,6 +184,7 @@ app.post(
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
       await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
+      await recordOrderFromSession(session);
     }
     res.json({ received: true });
   }
@@ -143,7 +206,7 @@ app.use(express.json({ limit: "25mb" }));
 --------------------------------------------------------------------- */
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, currency = "sgd", table, customer, items, returnUrl } = req.body;
+    const { amount, currency = "sgd", table, outlet, customer, items, subtotal, serviceCharge, gst, returnUrl } = req.body;
 
     if (!Number.isInteger(amount) || amount < 50) {
       return res.status(400).json({ error: "Invalid amount (must be integer cents, min 50)." });
@@ -192,6 +255,40 @@ app.post("/create-checkout-session", async (req, res) => {
       cancel_url: cancelUrl,
     });
 
+    // ⚠️ Critical for reliability: the order used to only ever get
+    // saved by the GUEST'S OWN BROWSER, after Stripe redirected them
+    // back here. If that round trip never completes — tab closed right
+    // after paying, connection drops, phone dies, anything — the guest
+    // was genuinely charged, but no order record was ever created, and
+    // the restaurant has no way to know the payment happened.
+    //
+    // Fixing that: the full order gets saved here, right now, BEFORE
+    // the guest even reaches Stripe's page — marked not-yet-paid, keyed
+    // by this session's id. The webhook below (which Stripe calls
+    // server-to-server, independent of the guest's device entirely)
+    // is what actually confirms and finalizes it once payment succeeds.
+    // That's the reliable path now; the guest's own browser completing
+    // the return trip is just a nice-to-have for instant UI feedback,
+    // no longer the only way an order gets recorded.
+    if (db) {
+      try {
+        await db.collection("checkoutPending").doc(session.id).set({
+          items: items || [],
+          table: table ? String(table) : null,
+          outlet: outlet || null,
+          subtotal: subtotal ?? null,
+          serviceCharge: serviceCharge ?? null,
+          gst: gst ?? null,
+          customerName: customer?.name || "",
+          customerEmail: customer?.email || "",
+          customerPhone: customer?.phone || "",
+          createdAt: new Date().toISOString(),
+        });
+      } catch (e) {
+        console.error("Failed to persist checkoutPending (order will fall back to the guest's browser completing the return trip):", e.message);
+      }
+    }
+
     res.json({ url: session.url, sessionId: session.id });
   } catch (err) {
     console.error("create-checkout-session failed:", err.message);
@@ -233,6 +330,7 @@ app.post("/order-paid", async (req, res) => {
     }
 
     await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
+    await recordOrderFromSession(session);
     res.json({ ok: true });
   } catch (err) {
     console.error("order-paid failed:", err.message);
