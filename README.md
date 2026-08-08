@@ -108,6 +108,17 @@ Add these on Render → Environment:
 `MERCHANT_WHATSAPP_NUMBER`, `SUPPLIER_WHATSAPP_NUMBER`,
 `RESEND_API_KEY`, `RECEIPT_FROM_EMAIL`.
 
+## Request size limit
+
+The frontend's menu photos and ad banners (images/GIFs/short MP4 clips)
+get sent here as part of the `/store/:key` payload. The body parser is
+set to accept up to **25mb** per request — comfortably covers a few
+photos or a short, compressed video clip, but if you see a `413
+Payload Too Large` error, that's this limit (`express.json({ limit:
+... })` near the top of `server.js`) — raise it if you need to, though
+see the frontend README's content specs for why keeping uploads small
+is the better fix.
+
 ## What each endpoint does
 
 | Endpoint | Purpose |
