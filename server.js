@@ -438,6 +438,51 @@ app.post("/outlet-secrets/:outletId", requireAdminKey, async (req, res) => {
   }
 });
 
+// Fetch this outlet's Green-API QR code (base64 PNG) so it can be shown
+// right inside the dashboard, instead of needing Green-API's own
+// console. Proxied through here (not called directly from the browser)
+// to avoid any CORS uncertainty with Green-API's endpoint, and to reuse
+// the same admin-key protection and Firestore-stored credentials as the
+// rest of /outlet-secrets.
+app.get("/outlet-secrets/:outletId/qr", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured" });
+  try {
+    const doc = await db.collection("outletSecrets").doc(req.params.outletId).get();
+    const s = doc.exists ? doc.data() : {};
+    if (!s.greenApiInstanceId || !s.greenApiApiToken) {
+      return res.status(400).json({ error: "Save this outlet's Green-API Instance ID and API Token first." });
+    }
+    const url = `https://api.green-api.com/waInstance${s.greenApiInstanceId}/qr/${s.greenApiApiToken}`;
+    const greenRes = await fetch(url);
+    const data = await greenRes.json();
+    res.json(data); // { type: "qrCode", message: "<base64 png>" } | { type: "alreadyLogged" } | { type: "error", message }
+  } catch (e) {
+    console.error("outlet-secrets QR fetch failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Poll this to find out if an outlet's Green-API instance has been
+// authorized yet (i.e. the QR above was scanned) — lets the dashboard
+// auto-detect a successful scan without a manual refresh.
+app.get("/outlet-secrets/:outletId/wa-status", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured" });
+  try {
+    const doc = await db.collection("outletSecrets").doc(req.params.outletId).get();
+    const s = doc.exists ? doc.data() : {};
+    if (!s.greenApiInstanceId || !s.greenApiApiToken) {
+      return res.status(400).json({ error: "Save this outlet's Green-API Instance ID and API Token first." });
+    }
+    const url = `https://api.green-api.com/waInstance${s.greenApiInstanceId}/getStateInstance/${s.greenApiApiToken}`;
+    const greenRes = await fetch(url);
+    const data = await greenRes.json();
+    res.json(data); // { stateInstance: "authorized" | "notAuthorized" | ... }
+  } catch (e) {
+    console.error("outlet-secrets status fetch failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ---------------------------------------------------------------------
    Notifications — fill in your real credentials in .env. Each block is
    independently optional: if the relevant env vars are missing, that
