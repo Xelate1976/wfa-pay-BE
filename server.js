@@ -27,6 +27,7 @@ import cors from "cors";
 import Stripe from "stripe";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
+import { getFirestore } from "firebase-admin/firestore";
 
 dotenv.config();
 
@@ -39,6 +40,17 @@ const app = express();
    server restart (Render's free tier restarts after ~15 min idle, and
    on every redeploy — that used to mean losing everything).
 
+   ⚠️ Database name matters: admin.firestore() with no arguments always
+   connects to a database literally named "(default)" — but a database
+   created through the Firestore console (rather than via `gcloud`) is
+   often given a different name instead. If yours isn't "(default)",
+   using admin.firestore() silently points at a database that doesn't
+   exist — every read/write then fails with a "5 NOT_FOUND" error, even
+   though "Firestore connected" already logged successfully (that
+   message only confirms the credentials parsed, not that the database
+   name is right). getFirestore(firebaseApp, FIRESTORE_DATABASE_ID)
+   below targets the real one explicitly instead of guessing.
+
    If GOOGLE_SERVICE_ACCOUNT_JSON isn't set, every storage function
    below falls back to the old in-memory behavior automatically, so
    this file still runs fine before you've set Firestore up — it just
@@ -48,9 +60,13 @@ let db = null;
 if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
   try {
     const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    db = admin.firestore();
-    console.log("Firestore connected — data will persist across restarts.");
+    const firebaseApp = admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    // Set FIRESTORE_DATABASE_ID on Render if your database isn't named
+    // "wfa-data" — check console.cloud.google.com > Firestore > your
+    // database's actual ID.
+    const databaseId = process.env.FIRESTORE_DATABASE_ID || "wfa-data";
+    db = getFirestore(firebaseApp, databaseId);
+    console.log(`Firestore connected (database: "${databaseId}") — data will persist across restarts.`);
   } catch (e) {
     console.error("Failed to initialize Firestore (check GOOGLE_SERVICE_ACCOUNT_JSON) — falling back to in-memory store:", e.message);
   }
