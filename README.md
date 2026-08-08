@@ -180,15 +180,15 @@ better fix; see the frontend README's content specs.
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /create-checkout-session` | Starts a Stripe Checkout for a cart total |
+| `POST /create-checkout-session` | Starts a Stripe Checkout for a cart total (the real total — subtotal + service charge + GST, already computed by the frontend) |
 | `GET /checkout-session/:id` | Looks up a session's payment status |
 | `POST /order-paid` | Re-verifies a session, fires notifications |
 | `POST /webhook` | Stripe's own confirmation — the reliable source of truth |
 | `POST /upload` | Saves a file to Cloud Storage, returns its URL |
-| `GET /orders`, `POST /orders` | Shared order list (each order is its own record — safe against two orders arriving at once) |
+| `GET /orders`, `POST /orders` | Shared order list (each order is its own record — safe against two orders arriving at once). Each order includes `subtotal`, `serviceCharge`, and `gst` alongside the final `total`, for reporting. |
 | `POST /orders/seed` | One-time demo history load, guarded against overwriting real orders |
 | `GET /notifications`, `POST /notifications` | Shared WhatsApp/email activity log |
-| `GET /store/:key`, `POST /store/:key` | Generic storage for the menu, tables, outlets, banners |
+| `GET /store/:key`, `POST /store/:key` | Generic storage for the menu, tables, outlets, banners, and GST/service charge settings (key `wfa-tax-settings`) |
 
 ## Before relying on this for real
 
