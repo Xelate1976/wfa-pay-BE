@@ -28,6 +28,7 @@ import Stripe from "stripe";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
+import { Storage } from "@google-cloud/storage";
 
 dotenv.config();
 
@@ -57,6 +58,7 @@ const app = express();
    won't persist anything until you do.
 --------------------------------------------------------------------- */
 let db = null;
+let bucket = null;
 if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
   try {
     const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
@@ -67,6 +69,20 @@ if (process.env.GOOGLE_SERVICE_ACCOUNT_JSON) {
     const databaseId = process.env.FIRESTORE_DATABASE_ID || "wfa-data";
     db = getFirestore(firebaseApp, databaseId);
     console.log(`Firestore connected (database: "${databaseId}") — data will persist across restarts.`);
+
+    // Cloud Storage — for menu photos and ad banners (images/GIFs/video).
+    // Firestore caps every document at 1MiB, which a single photo or
+    // clip can exceed on its own — that's not something splitting data
+    // across more documents can fix. Real files need real file storage
+    // instead of being embedded as base64 text. Only enabled if
+    // GCS_BUCKET_NAME is set; see README for how to create the bucket.
+    if (process.env.GCS_BUCKET_NAME) {
+      const storage = new Storage({ credentials: serviceAccount, projectId: serviceAccount.project_id });
+      bucket = storage.bucket(process.env.GCS_BUCKET_NAME);
+      console.log(`Cloud Storage connected (bucket: "${process.env.GCS_BUCKET_NAME}").`);
+    } else {
+      console.log("[notice] GCS_BUCKET_NAME not set — uploads will keep failing once they exceed Firestore's 1MiB document limit.");
+    }
   } catch (e) {
     console.error("Failed to initialize Firestore (check GOOGLE_SERVICE_ACCOUNT_JSON) — falling back to in-memory store:", e.message);
   }
@@ -306,6 +322,46 @@ async function notifyOnPayment({ amountCents, metadata }) {
 }
 
 app.get("/", (_req, res) => res.send("WFA Asia payments backend is running."));
+
+/* ---------------------------------------------------------------------
+   File uploads — menu photos and ad banners (images/GIFs/video) go here
+   instead of into Firestore directly. The frontend converts a picked
+   file to base64 and POSTs it here; this saves it to Cloud Storage and
+   hands back a public URL, which is what actually gets saved in the
+   menu/banner data (a short string, not the whole file).
+--------------------------------------------------------------------- */
+app.post("/upload", async (req, res) => {
+  if (!bucket) {
+    return res.status(501).json({
+      error: "Cloud Storage isn't configured yet (set GCS_BUCKET_NAME on the backend) — see README for setup steps.",
+    });
+  }
+  try {
+    const { filename, contentType, dataBase64 } = req.body;
+    if (!dataBase64) return res.status(400).json({ error: "dataBase64 required" });
+
+    const buffer = Buffer.from(dataBase64, "base64");
+    const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${(filename || "file").replace(/[^a-zA-Z0-9.\-_]/g, "_")}`;
+    const path = `uploads/${safeName}`;
+    const file = bucket.file(path);
+
+    await file.save(buffer, {
+      contentType: contentType || "application/octet-stream",
+      metadata: { cacheControl: "public, max-age=31536000" },
+      // Not passing `public: true` here on purpose — buckets created
+      // with Uniform bucket-level access (Google's current default)
+      // reject per-object ACL calls like that. Public read is instead
+      // granted once at the bucket level (allUsers → Storage Object
+      // Viewer) — see README — which works regardless of bucket mode.
+    });
+
+    const url = `https://storage.googleapis.com/${bucket.name}/${path}`;
+    res.json({ url });
+  } catch (e) {
+    console.error("upload failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 /* ---------------------------------------------------------------------
    Generic shared store — the menu, table list, outlets, and banners all
