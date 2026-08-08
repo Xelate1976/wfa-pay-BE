@@ -1,147 +1,201 @@
-# WFA Asia — order & dashboard app (standalone)
+# WFA Asia — payments & shared-data backend
 
-This started out as a Claude artifact — pulled out into a normal
-website so it can actually call the Stripe payments backend
-(`wfa-pay-BE`). Claude's artifact preview blocks that kind of outbound
-network call for security; a real deployed site doesn't have that
-restriction.
+The Express server behind the WFA Asia ordering app (`FD-payment` /
+`fd-payment.vercel.app`). It does three separate jobs:
 
-## What's in here
+1. **Payments** — creates Stripe Checkout Sessions, verifies them, and
+   fires WhatsApp (Twilio) + email (Resend) notifications once a guest
+   pays.
+2. **Shared data store** — orders, the menu, tables, outlets, and ad
+   banners all live here (in Firestore, if configured — see below), so
+   a guest's phone and the merchant's dashboard device see the same
+   data instead of each being stuck with their own local copy.
+3. **File uploads** — menu photos and ad banners (images/GIFs/video) go
+   to Cloud Storage (if configured), returning a URL instead of
+   embedding the whole file in Firestore.
 
-**Customer-facing ordering page:**
-- QR-code table ordering (and outlet picking, if you run more than one
-  location)
-- Menu with categories, photos, and per-item **taste profile popups**
-  (a radar chart — body / sweetness / acidity / tannin — plus food
-  pairing notes; tap any item to see it)
-- Rotating ad banner — images, GIFs, or short MP4 clips
-- Stripe Checkout for payment, same-tab redirect
+This is a real working backend, not a toy — but it's sized for one
+venue's worth of traffic, not a production platform. See "Before
+relying on this for real" at the bottom for what to tighten up.
 
-**Merchant dashboard** (PIN-gated):
-- **Sales** — revenue/orders overview by day/week/month/year
-- **Outlets** — manage multiple locations, grouped under **chains**
-  (e.g. every branch of one brand rolls up into a single filter option
-  across the whole dashboard)
-- **Tables** — add/rename/remove tables per outlet, download/print QR
-  codes
-- **Menu** — add/edit/delete items: pricing, photos, RFID tier, taste
-  profile sliders, pairing notes
-- **Banner** — upload/manage the rotating ad content
-- **Reports** — a filterable, sortable transaction table (Power BI–
-  style), plus product/table/outlet breakdowns and CSV export
-- **Charts** — a drag-and-drop-ish chart builder: pick an X-axis, an
-  optional second breakdown axis, a measure, and a chart type (bar,
-  line, area, pie)
+## 1. Get your Stripe keys
 
-## How data storage works
+1. Sign in to the [Stripe dashboard](https://dashboard.stripe.com).
+2. Developers → API keys → copy the **Publishable key** (`pk_test_...`)
+   and **Secret key** (`sk_test_...`). Use test keys until you're ready
+   to go live.
+3. Put the secret key here as `STRIPE_SECRET_KEY` (see step 3 below).
+4. Put the **publishable** key into the front-end app
+   (`STRIPE_PUBLISHABLE_KEY` near the top of `src/App.jsx` in the
+   `FD-payment` repo) — safe to expose in browser code; the secret key
+   never is.
 
-Orders, notifications, the menu, tables, outlets, and banners all live
-on the backend (`wfa-pay-BE`), not in this app's own browser storage —
-that's what makes them show up consistently across a guest's phone and
-the merchant's dashboard device.
-
-The backend itself supports two modes:
-- **Firestore** (real database) — data survives server restarts. Set up
-  by adding a `GOOGLE_SERVICE_ACCOUNT_JSON` environment variable on
-  Render; see `wfa-pay-BE`'s own README for setup steps.
-- **In-memory fallback** — used automatically if Firestore isn't
-  configured. Works fine for quick testing, but all data resets
-  whenever the server restarts (Render's free tier does this after
-  ~15 minutes idle, and on every redeploy).
-
-If `BACKEND_URL`/`STRIPE_PUBLISHABLE_KEY` at the top of `src/App.jsx`
-aren't filled in yet, the app falls back to browser `localStorage`
-instead — fine for solo local testing, but orders won't be shared
-across devices in that mode.
-
-**Uploaded files** (menu photos, ad banners) go through a separate
-path — the picked file gets sent to the backend's `/upload` endpoint,
-which saves it to **Cloud Storage** and returns a short URL; that URL
-is what actually gets stored in the menu/banner data, not the file
-itself. This matters because Firestore documents cap out at 1MiB, which
-a single photo or video clip can exceed on its own — see `wfa-pay-BE`'s
-README for the Cloud Storage setup steps. If Cloud Storage isn't set up
-yet, uploads still work by embedding the file directly (matching the
-old behavior) — fine for a couple of small photos, but will eventually
-hit that 1MiB ceiling once anything gets larger.
-
-## Content specs
-
-**Menu item photos** (Merchant → Menu → per item): any reasonable photo
-works — square-ish crops look best (displayed as small thumbnails). No
-strict size requirement.
-
-**Taste profiles** (Merchant → Menu → per item): four sliders, each
-0–5 — **Body, Sweetness, Acidity, Tannin** — plus an optional "Pairs
-well with" text note. These render as a radar chart when a guest taps
-the item on the ordering page. Leaving all four at 0 just hides the
-chart for that item (shows a "no profile set" message instead).
-
-**Ad banners** (Merchant → Banner): images, GIFs, and short MP4 clips
-all work. The banner area's aspect ratio is:
-- **16:7** on mobile
-- **16:6** on desktop
-
-Since one asset needs to work across both, and it's displayed with
-`object-cover` (fills the frame, cropping edges rather than stretching
-or letterboxing):
-
-- **Recommended size: 1600 × 700px** (or a multiple, e.g. 1920 × 840px)
-- Keep important content (text, logos, product shots) centered in the
-  middle ~60% of the frame — the top/bottom edges are what gets cropped
-  on wider desktop screens
-- **Video clips**: keep them short (5–15s is a good range) — a video
-  banner plays to completion before advancing to the next one, so a
-  long clip holds up the whole rotation. Always muted (autoplay
-  browsers require this), so audio doesn't matter.
-- **File size**: with Cloud Storage set up (see `wfa-pay-BE`'s README),
-  uploads go to real file storage and this isn't much of a concern.
-  Without it, uploads embed directly in the shared data instead — keep
-  those small (well under 1MB) to stay clear of Firestore's document
-  size limit.
-
-## Run it locally
+## 2. Run it locally
 
 ```bash
 npm install
+cp .env.example .env   # then fill in STRIPE_SECRET_KEY at minimum
 npm run dev
 ```
 
-Opens at `http://localhost:5173`.
+Listens on `http://localhost:4000` by default.
 
-## Deploy to Vercel
+## 3. Deploy it (Render)
 
-1. Push this folder to a GitHub repo (a separate repo from the backend
-   — e.g. `FD-payment`)
-2. Go to [vercel.com](https://vercel.com) → sign in → **Add New** →
-   **Project**
-3. Import that repo — Vercel auto-detects Vite, no config needed
-4. Click **Deploy**
-5. You'll get a URL like `https://your-project.vercel.app`
+1. Push this folder to its own GitHub repo (`wfa-pay-BE`)
+2. [render.com](https://render.com) → **New +** → **Web Service** →
+   connect that repo, branch `main`
+3. Runtime: **Node** (not Docker) · Build command: `npm install` ·
+   Start command: `npm start`
+4. Under **Environment**, add at minimum:
+   - `STRIPE_SECRET_KEY` → your `sk_test_...` key
+   - `ALLOWED_ORIGIN` → `*` for now (tighten to your real frontend URL
+     once you have one — see the frontend's own README)
+5. Create the service — you'll get a URL like
+   `https://wfa-pay-be.onrender.com`
 
-## After deploying
+Then put that URL into `BACKEND_URL` near the top of `src/App.jsx` in
+the frontend repo.
 
-**Update CORS on the backend.** Right now `wfa-pay-BE`'s
-`ALLOWED_ORIGIN` is set to `*` (any site can call it) — fine for
-testing, but once you have a real frontend URL, tighten it:
+## 4. Register the Stripe webhook
 
-1. Render → `wfa-pay-BE` → Environment
-2. Change `ALLOWED_ORIGIN` to your Vercel URL, e.g.
-   `https://your-project.vercel.app`
-3. Save — Render redeploys automatically
+Dashboard → Developers → Webhooks → Add endpoint:
+- URL: `https://YOUR-RENDER-URL/webhook`
+- Event: `checkout.session.completed`
 
-**Print QR codes from the real URL.** Table QR codes encode whatever
-URL the app is running at (outlet + table), so generate/print them
-*from the deployed Vercel site*, not from anywhere else — otherwise
-they'll point guests at a URL that doesn't exist.
+Copy the signing secret it gives you into `STRIPE_WEBHOOK_SECRET` on
+Render.
 
-## Test a real payment
+## 5. Set up persistent storage (Firestore)
 
-1. Open your Vercel URL, pick an outlet (if you have more than one)
-   and a table, add an item, checkout
-2. Fill in name/email, tap Pay — opens Stripe's Checkout page in the
-   same tab, then redirects back automatically once paid
-3. Use test card `4242 4242 4242 4242`, any future expiry, any CVC
-4. Confirm the payment in Stripe's test dashboard, and confirm the
-   order shows up on the merchant dashboard (may take up to ~15s, or
-   refresh manually)
+Without this, orders/menu/etc. live in server memory and **reset every
+time the server restarts** (Render's free tier does this after ~15 min
+idle, and on every redeploy). Firestore fixes that — data survives
+restarts permanently.
+
+1. [console.cloud.google.com](https://console.cloud.google.com) →
+   create a project (or use an existing one)
+2. Search **Firestore** → **Create database** → **Native mode** → pick
+   a region
+3. **⚠️ Note the exact database ID it gets** — shown at the top of the
+   Firestore page (e.g. `wfa-data`). This is NOT necessarily
+   `"(default)"`, and it matters — see the warning box below.
+4. **IAM & Admin → Service Accounts → Create Service Account** → give
+   it the **Cloud Datastore User** role
+5. That service account → **Keys** → **Add Key → Create new key →
+   JSON** — downloads a `.json` file
+6. Copy that file's entire contents into a Render environment variable
+   named `GOOGLE_SERVICE_ACCOUNT_JSON`
+7. If your database ID isn't `wfa-data`, also add
+   `FIRESTORE_DATABASE_ID` on Render set to the real one
+
+Check Render's **Logs** tab after it redeploys — you should see:
+```
+Firestore connected (database: "wfa-data") — data will persist across restarts.
+```
+
+**⚠️ Database name gotcha (cost us a while to track down):** the
+Firestore client defaults to a database literally named `"(default)"`.
+If your database was created with a custom name (which the Firestore
+console does by default) rather than `"(default)"`, connecting without
+specifying the name doesn't fail loudly — it logs a successful-looking
+"Firestore connected" message, but then every actual read/write fails
+with a `5 NOT_FOUND` error, because it's silently trying to reach a
+database that doesn't exist. This file already handles it correctly
+(`getFirestore(app, databaseId)`, defaulting to `"wfa-data"`, override-
+able via `FIRESTORE_DATABASE_ID`) — just make sure that name actually
+matches what you see in the Firestore console.
+
+If `GOOGLE_SERVICE_ACCOUNT_JSON` is missing entirely, you'll instead
+see `[notice] GOOGLE_SERVICE_ACCOUNT_JSON not set...` — the server
+still runs fine, just without persistence, until you set it.
+
+## 6. Set up file storage (Cloud Storage)
+
+Firestore caps every document at **1MiB** — a single decent photo, and
+especially any video clip, can exceed that on its own. Without Cloud
+Storage set up, menu photo/banner uploads will eventually fail with a
+Firestore `INVALID_ARGUMENT: ... exceeds the maximum allowed size`
+error once they get large enough.
+
+1. Same Google Cloud project as above → search **Cloud Storage** →
+   **Buckets** → **Create**
+2. Name it anything globally unique (e.g.
+   `your-project-id-media`) · same region as Firestore · leave
+   **Uniform bucket-level access** on (Google's current default — the
+   code is written to work with this)
+3. **Remove Public Access Prevention** on the bucket (Bucket details →
+   "Public access" section) — this has to be off before you can grant
+   public read access in the next step
+4. Bucket → **Permissions** → **Grant access** → principal `allUsers`
+   → role **Storage Object Viewer** → Save (confirms it's making the
+   bucket's contents publicly readable — expected, since these are
+   guest-facing menu photos/banners)
+5. **IAM & Admin → IAM** → find your service account (the same one
+   from step 5 above) → edit → **Add another role** → **Storage Object
+   Admin** — without this specific role, uploads fail with a `403:
+   storage.objects.create` permission error even though Firestore
+   itself works fine (these are separate Google services with
+   separate permissions)
+6. Add `GCS_BUCKET_NAME` on Render, set to your bucket's exact name
+
+Check Render's Logs for:
+```
+Cloud Storage connected (bucket: "your-bucket-name").
+```
+
+If `GCS_BUCKET_NAME` isn't set, uploads keep working the old way
+(embedded directly in Firestore) until they hit the 1MiB ceiling.
+
+## 7. WhatsApp and email (optional)
+
+Both are independently optional — if their env vars are missing, that
+notification channel is just skipped (logged, not thrown).
+
+- **WhatsApp**: Twilio's WhatsApp sandbox works immediately for testing
+  (numbers must first "join" the sandbox by messaging a code). For a
+  real business number, apply through Twilio for WhatsApp Business API
+  access — involves Meta business verification, takes a few days.
+- **Email**: [Resend](https://resend.com) needs a verified sending
+  domain before `RECEIPT_FROM_EMAIL` will work. Any transactional
+  email provider (Postmark, SendGrid) would drop in similarly — swap
+  the `fetch` call in `notifyOnPayment()`.
+
+Add these on Render → Environment:
+`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_FROM`,
+`MERCHANT_WHATSAPP_NUMBER`, `SUPPLIER_WHATSAPP_NUMBER`,
+`RESEND_API_KEY`, `RECEIPT_FROM_EMAIL`.
+
+## Request size limit
+
+Uploads are sent here as base64 in the request body before being
+forwarded to Cloud Storage. The body parser accepts up to **25mb** per
+request — comfortably covers a few photos or a short, compressed video
+clip. A `413 Payload Too Large` error means this limit
+(`express.json({ limit: ... })` near the top of `server.js`) needs
+raising — though keeping uploads small in the first place is the
+better fix; see the frontend README's content specs.
+
+## What each endpoint does
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /create-checkout-session` | Starts a Stripe Checkout for a cart total |
+| `GET /checkout-session/:id` | Looks up a session's payment status |
+| `POST /order-paid` | Re-verifies a session, fires notifications |
+| `POST /webhook` | Stripe's own confirmation — the reliable source of truth |
+| `POST /upload` | Saves a file to Cloud Storage, returns its URL |
+| `GET /orders`, `POST /orders` | Shared order list (each order is its own record — safe against two orders arriving at once) |
+| `POST /orders/seed` | One-time demo history load, guarded against overwriting real orders |
+| `GET /notifications`, `POST /notifications` | Shared WhatsApp/email activity log |
+| `GET /store/:key`, `POST /store/:key` | Generic storage for the menu, tables, outlets, banners |
+
+## Before relying on this for real
+
+- Tighten `ALLOWED_ORIGIN` to your actual frontend domain instead of `*`
+- Set up Firestore (step 5) and Cloud Storage (step 6) if you haven't
+  — without them, data resets on restart and uploads eventually fail
+- Add real request logging/monitoring
+- Consider rate-limiting the public endpoints
+- Move off Twilio's WhatsApp sandbox to a verified business sender
+  before depending on those notifications for real service
