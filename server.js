@@ -183,7 +183,7 @@ app.post(
 
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
-      await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
+      await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata, sessionId: session.id });
       await recordOrderFromSession(session);
     }
     res.json({ received: true });
@@ -330,7 +330,7 @@ app.post("/order-paid", async (req, res) => {
       return res.status(400).json({ error: `Payment not confirmed (status: ${session.payment_status})` });
     }
 
-    await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata });
+    await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata, sessionId });
     await recordOrderFromSession(session);
     res.json({ ok: true });
   } catch (err) {
@@ -543,7 +543,47 @@ app.get("/outlet-secrets/:outletId/telegram-chat-id", requireAdminKey, async (re
    independently optional: if the relevant env vars are missing, that
    channel is just skipped (logged, not thrown).
 --------------------------------------------------------------------- */
-async function notifyOnPayment({ amountCents, metadata }) {
+/* ---------------------------------------------------------------------
+   notifyOnPayment() is called from two places — the Stripe webhook
+   (the reliable source of truth) and /order-paid (a convenience call
+   the frontend makes for instant UI feedback once it notices payment
+   succeeded via polling). Both routinely fire for the same order
+   within moments of each other, so without this guard every order
+   sends every notification TWICE. A Firestore transaction (not a
+   plain read-then-write) matters here specifically because a plain
+   check has a race window where both nearly-simultaneous calls could
+   see "not yet notified" before either one writes the flag.
+--------------------------------------------------------------------- */
+const notifiedSessionsFallback = new Set(); // used only when Firestore isn't configured
+
+async function markNotifiedOnce(sessionId) {
+  if (!sessionId) return true; // no id to dedupe on — just notify
+  if (!db) {
+    if (notifiedSessionsFallback.has(sessionId)) return false;
+    notifiedSessionsFallback.add(sessionId);
+    return true;
+  }
+  const ref = db.collection("checkoutPending").doc(sessionId);
+  try {
+    return await db.runTransaction(async (t) => {
+      const doc = await t.get(ref);
+      if (doc.exists && doc.data().notified) return false;
+      t.set(ref, { notified: true }, { merge: true });
+      return true;
+    });
+  } catch (e) {
+    console.error(`markNotifiedOnce failed for session ${sessionId}, notifying anyway:`, e.message);
+    return true; // fail open — better an occasional duplicate than a silently dropped order alert
+  }
+}
+
+async function notifyOnPayment({ amountCents, metadata, sessionId }) {
+  const shouldNotify = await markNotifiedOnce(sessionId);
+  if (!shouldNotify) {
+    console.log(`[skipped] Notifications already sent for session ${sessionId} — this is the second (webhook/order-paid) call for the same order.`);
+    return;
+  }
+
   const total = (amountCents / 100).toFixed(2);
   const { table, customerEmail, items, outlet } = metadata || {};
 
