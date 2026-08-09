@@ -2,7 +2,8 @@
 
 Express/Node backend for the WFA Asia ordering system. Handles menu,
 outlets, tables, and banner data via Firestore, media uploads via
-Cloud Storage, and payments via Stripe Checkout + webhooks. Serves the
+Cloud Storage, payments via Stripe Checkout + webhooks, and order
+notifications via WhatsApp, Telegram, and email. Serves the
 `FD-payment` frontend.
 
 - **Frontend repo**: `Xelate1976/FD-payment`
@@ -16,13 +17,16 @@ Cloud Storage, and payments via Stripe Checkout + webhooks. Serves the
 - **Stripe Checkout** — creates checkout sessions for cart orders,
   redirects same-tab
 - **Stripe webhook** (`POST /webhook`) — listens for
-  `checkout.session.completed`, records the paid order and notifies
-  the merchant dashboard
+  `checkout.session.completed`, records the paid order and fires
+  notifications
 - **Firestore** — persistent storage for outlets, menu, tables,
   banners, orders, and notifications (all under a `kv` collection)
 - **Cloud Storage** — real file storage for uploaded menu photos and
   banner media (images/GIFs/MP4), so Firestore's 1MiB document limit
   isn't a bottleneck
+- **Order notifications** — WhatsApp (via Green-API), Telegram, and
+  email (via Resend), each independently optional and configurable
+  **per outlet** — see below
 - **CORS** — locked to a single allowed origin (the deployed frontend)
   via `ALLOWED_ORIGIN`
 
@@ -38,6 +42,11 @@ Cloud Storage, and payments via Stripe Checkout + webhooks. Serves the
 | `GCS_BUCKET_NAME` | Cloud Storage bucket name for media uploads, e.g. `wfa-project-504813-media` |
 | `FIRESTORE_DATABASE_ID` | Firestore database ID — see gotcha below, this is **not** `(default)` |
 | `GOOGLE_SERVICE_ACCOUNT_JSON` | (Render only) explicit service account credentials JSON. Not needed on Cloud Run — see Credentials section below |
+| `ADMIN_API_KEY` | Shared secret protecting the `/outlet-secrets/*` endpoints — see Notifications section below |
+| `GREENAPI_INSTANCE_ID` / `GREENAPI_API_TOKEN` | Shared fallback WhatsApp (Green-API) credentials, used by any outlet that hasn't set its own |
+| `MERCHANT_WHATSAPP_NUMBER` / `SUPPLIER_WHATSAPP_NUMBER` | Shared fallback WhatsApp recipient numbers (digits only, no `+`) |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Shared fallback Telegram credentials, used the same way as the Green-API fallback above |
+| `RESEND_API_KEY` / `RECEIPT_FROM_EMAIL` | Email receipts to customers via Resend |
 
 A `.env.example` in this repo lists these for local development.
 
@@ -72,6 +81,135 @@ quick testing, but everything resets on restart/redeploy.
 
 ---
 
+## Order notifications — WhatsApp, Telegram, email
+
+Each order-paid event fires up to three channels, all independently
+optional:
+
+### Per-outlet vs. shared fallback
+Every outlet can have its **own** WhatsApp/Telegram credentials —
+useful since each physical location often has its own staff phone or
+group chat. Set from the dashboard (**Merchant → Outlets → WhatsApp**
+button on each outlet row). If an outlet hasn't configured its own,
+notifications fall back to the shared `GREENAPI_*`/`TELEGRAM_*` env
+vars above. This resolution happens automatically in
+`notifyOnPayment()` — no code changes needed to onboard a new outlet's
+own number.
+
+### Why outlet credentials live in a separate Firestore collection
+Per-outlet WhatsApp tokens and Telegram bot tokens are stored in a
+dedicated `outletSecrets` collection — **not** mixed into the public
+`kv/wfa-outlets` document that the customer ordering page fetches
+openly. Mixing secrets into a document a guest's browser can read
+would leak them straight into browser dev tools.
+
+### `requireAdminKey` — protecting the outlet-secrets endpoints
+All `/outlet-secrets/*` routes require an `x-admin-key` header
+matching the `ADMIN_API_KEY` env var. If `ADMIN_API_KEY` isn't set,
+the check is skipped (convenient for local dev — set it before going
+live). The dashboard prompts for this key at runtime rather than
+hardcoding it in the frontend bundle — see the frontend README for why
+that distinction matters.
+
+**Endpoints:**
+| Route | Purpose |
+|---|---|
+| `GET /outlet-secrets/:outletId` | Fetch an outlet's saved WhatsApp/Telegram config |
+| `POST /outlet-secrets/:outletId` | Save/update an outlet's config (merges, doesn't overwrite unset fields) |
+| `GET /outlet-secrets/:outletId/qr` | Proxies Green-API's QR endpoint — lets the dashboard show a live "scan to link" QR code without opening Green-API's own console |
+| `GET /outlet-secrets/:outletId/wa-status` | Polls whether that outlet's WhatsApp instance is authorized yet, so the dashboard can auto-detect a successful scan |
+| `GET /outlet-secrets/:outletId/telegram-chat-id` | Looks up a Telegram chat's numeric ID automatically via `getUpdates`, after the merchant has messaged the bot once — saves hunting through Telegram's raw API by hand |
+
+### WhatsApp via Green-API
+Wraps a WhatsApp Web session in a REST API — no Meta Business
+verification or template approval needed, so it's fast to set up.
+Trade-off: it's not the official WhatsApp Business Platform, so it's
+best suited to low-volume internal alerts (a merchant/supplier
+number), not bulk customer-facing messaging. The WhatsApp *number*
+itself needs to be linked once via QR code (console.green-api.com, or
+directly from the dashboard's "Show QR to link" button) before
+messages will actually deliver — an unlinked instance queues messages
+without sending them, which looks like a silent failure if you don't
+know to check.
+
+**Common failure modes:**
+- **QR code expired before scanning** — Green-API QR codes expire in
+  ~15–20s. The dashboard's QR display auto-refreshes every 15s to
+  cover this; if linking through Green-API's own console instead,
+  regenerate the code right before scanning.
+- **"Can't link new devices right now"** on WhatsApp's side — usually
+  an expired/stale QR (see above), occasionally WhatsApp's own
+  4-linked-device cap, rarely a temporary rate limit after several
+  attempts in a short window.
+
+### Telegram
+Simpler and more reliable than WhatsApp for this use case — no device
+linking, no expiring codes, just a bot token + chat ID.
+1. Message **@BotFather** on Telegram, `/newbot`, follow the prompts →
+   get a token like `123456789:ABC-defGhIJKlmNoPQ`
+2. Save that token for the outlet (or as the shared `TELEGRAM_BOT_TOKEN`
+   fallback)
+3. Message the bot once from the chat you want alerts in
+4. Use the dashboard's "Find my Chat ID" button (or call
+   `GET /outlet-secrets/:outletId/telegram-chat-id` directly) to
+   auto-fill the chat ID
+
+#### If "Find my Chat ID" comes back empty
+This has happened even with a freshly created bot, a confirmed-correct
+saved token (verified directly against Firestore), and messages that
+show as delivered (double checkmarks) in the Telegram client — with
+`getUpdates` still reporting `"result":[]`, checked both from a
+browser and from the backend itself. Root cause unconfirmed; possibly
+a propagation delay on very new bots. Rather than chase it further in
+the moment, there's a reliable manual workaround:
+1. In Telegram, message **@userinfobot** (a long-running, independent
+   community utility bot — not affiliated with this project)
+2. It replies instantly with your numeric Telegram user ID
+3. For a private 1-on-1 chat with any bot, that number **is** the chat
+   ID — paste it directly into the **Telegram Chat ID** field and Save,
+   skipping "Find my Chat ID" entirely
+
+Things worth ruling out first if this comes up again:
+- **Wrong token** — confirm via `GET https://api.telegram.org/bot<TOKEN>/getMe`
+  that the `username` matches the bot you're actually messaging
+- **A webhook already registered on that bot** — check
+  `GET https://api.telegram.org/bot<TOKEN>/getWebhookInfo`; a non-empty
+  `url` means Telegram is routing updates there instead of to
+  `getUpdates`, and `deleteWebhook` needs to be called first
+- **Group chat with bot privacy mode on** — bots can't see regular
+  group messages by default; turn off Group Privacy for that bot via
+  BotFather → `/mybots` → Bot Settings, or just message it directly
+  instead of in a group
+
+### Email via Resend
+Sends a receipt to the *customer's* email on successful payment (not
+a merchant alert channel like the two above). Requires `RESEND_API_KEY`
+and, optionally, `RECEIPT_FROM_EMAIL` (defaults to a placeholder
+address — set this to a real verified sending domain before going
+live).
+
+### Why notifications used to arrive twice
+`notifyOnPayment()` is called from **two** places — the Stripe webhook
+(`POST /webhook`, the reliable source of truth) and `/order-paid` (a
+convenience call the frontend makes for instant UI feedback once it
+notices payment succeeded via polling). Both routinely fire for the
+same order within moments of each other, so without a guard, every
+WhatsApp/Telegram/email notification went out **twice** per order.
+
+Fixed via `markNotifiedOnce(sessionId)` — checks/sets a `notified`
+flag on that session's `checkoutPending` Firestore document inside a
+**transaction**, not a plain read-then-write. The transaction matters
+specifically because a plain check has a race window where both
+near-simultaneous calls could see "not yet notified" before either one
+writes the flag — a transaction makes only one of them actually win.
+Without Firestore configured (in-memory fallback mode), a simple
+in-memory `Set` does the same job for a single server instance, though
+it won't dedupe across multiple Cloud Run instances in that fallback
+mode — one more reason Firestore should be considered required for any
+real deployment, not just nice-to-have.
+
+---
+
 ## Deployment
 
 ### Cloud Run (asia-southeast1) — primary
@@ -98,6 +236,13 @@ ERROR: error fetching DeveloperConnect credentials: googleapi: Error 403:
 Permission 'developerconnect.gitRepositoryLinks.fetchReadToken' denied
 ```
 
+**Deploying real changes vs. "Redeploy"**: Cloud Run/Vercel's
+"Redeploy" option rebuilds the *exact same* previously-built snapshot
+— it does **not** pull new commits from GitHub, no matter how many
+times you click it. Always push a real, new commit to trigger a fresh
+build; check the build log for a new bundle/image hash to confirm it
+actually picked up your latest change.
+
 ### Render — legacy/backup
 - URL: https://wfa-pay-be.onrender.com
 - Uses `GOOGLE_SERVICE_ACCOUNT_JSON` for Firestore/Cloud Storage auth
@@ -114,7 +259,8 @@ Firestore projects can have multiple databases. This project has two:
 - `(default)` — **empty**, created automatically by Google Cloud, not
   used
 - `wfa-data` — the **real** database, holds everything (outlets, menu,
-  banners, tables, orders) under the `kv` collection
+  banners, tables, orders, outletSecrets) under the `kv` and
+  `outletSecrets` collections
 
 If `FIRESTORE_DATABASE_ID` is unset or set to `(default)`, every
 read/write silently fails with:
