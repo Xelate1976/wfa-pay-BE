@@ -29,6 +29,7 @@ import dotenv from "dotenv";
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
 import { Storage } from "@google-cloud/storage";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -117,7 +118,21 @@ const memStore = {};
 let memOrders = [];
 let memNotifications = [];
 
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || "*" }));
+// ALLOWED_ORIGIN can now be a comma-separated list — needed once there's
+// more than one frontend (ordering site, merchant dashboard, this new
+// live-orders screen, etc.) all calling the same backend. A single
+// string still works fine (one origin = a list of one).
+const allowedOrigins = (process.env.ALLOWED_ORIGIN || "*").split(",").map((o) => o.trim()).filter(Boolean);
+app.use(cors({
+  origin: (origin, callback) => {
+    // `origin` is undefined for same-origin/non-browser requests (curl,
+    // server-to-server, Stripe's own calls) — always allow those through.
+    if (!origin || allowedOrigins.includes("*") || allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+    callback(new Error(`CORS: origin "${origin}" is not in ALLOWED_ORIGIN`));
+  },
+}));
 
 // The reliable path: looks up what was saved at checkout-creation time
 // (see /create-checkout-session) and writes it into the real orders
@@ -204,15 +219,69 @@ app.use(express.json({ limit: "25mb" }));
    that's just a normal navigation, not a script load, so it works even
    in sandboxes that block loading third-party JS (like Claude artifacts).
 --------------------------------------------------------------------- */
+// Bump this whenever the membership/marketing consent wording changes —
+// stored on every member record so it's always clear which version of
+// the notice someone actually agreed to, in case that's ever disputed.
+const MEMBERSHIP_CONSENT_VERSION = "2026-08-09";
+
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, currency = "sgd", table, outlet, customer, items, subtotal, serviceCharge, gst, returnUrl } = req.body;
+    const { amount, currency = "sgd", table, outlet, customer, items, subtotal, serviceCharge, gst, returnUrl, wantsMembership, marketingConsent } = req.body;
 
     if (!Number.isInteger(amount) || amount < 50) {
       return res.status(400).json({ error: "Invalid amount (must be integer cents, min 50)." });
     }
     if (!returnUrl) {
       return res.status(400).json({ error: "returnUrl is required (the ordering app's own URL)." });
+    }
+
+    // Membership + first-order discount — deliberately entirely
+    // server-side. Eligibility is decided here, never trusted from the
+    // browser, and the discount is baked directly into the real Stripe
+    // amount below — never just a display-only trick in the UI. See
+    // README for the PDPA consent design this is built around: the
+    // discount checkbox and the marketing checkbox are two separate,
+    // independently-tracked consents, never bundled into one.
+    let finalAmount = amount;
+    let discountApplied = false;
+    let discountCents = 0;
+    const email = normalizeEmail(customer?.email);
+
+    if (wantsMembership && db && email) {
+      try {
+        const memberRef = db.collection("members").doc(email);
+        discountApplied = await db.runTransaction(async (t) => {
+          const doc = await t.get(memberRef);
+          const alreadyUsed = doc.exists && doc.data().firstOrderDiscountUsed;
+          if (alreadyUsed) {
+            // Still record/update marketing preference even if the
+            // discount itself was already used on a prior visit — the
+            // two consents are independent of each other.
+            if (typeof marketingConsent === "boolean") {
+              t.set(memberRef, { marketingConsent, marketingConsentUpdatedAt: new Date().toISOString() }, { merge: true });
+            }
+            return false;
+          }
+          t.set(memberRef, {
+            email,
+            name: customer?.name || "",
+            phone: customer?.phone || "",
+            joinedAt: doc.exists ? doc.data().joinedAt : new Date().toISOString(),
+            firstOrderDiscountUsed: true,
+            firstOrderDiscountUsedAt: new Date().toISOString(),
+            marketingConsent: !!marketingConsent,
+            consentGivenAt: new Date().toISOString(),
+            consentVersion: MEMBERSHIP_CONSENT_VERSION,
+          }, { merge: true });
+          return true;
+        });
+        if (discountApplied) {
+          discountCents = Math.round(amount * 0.10);
+          finalAmount = Math.max(50, amount - discountCents); // Stripe minimum still applies
+        }
+      } catch (e) {
+        console.error(`Membership discount check failed for ${email}, proceeding without discount:`, e.message);
+      }
     }
 
     // Bug fixed: this used to send guests to a static "you can close this
@@ -236,10 +305,10 @@ app.post("/create-checkout-session", async (req, res) => {
           price_data: {
             currency,
             product_data: {
-              name: `WFA Asia order${table ? ` — Table ${table}` : ""}`,
+              name: `WFA Asia order${table ? ` — Table ${table}` : ""}${discountApplied ? " (10% member discount applied)" : ""}`,
               description: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500) || undefined,
             },
-            unit_amount: amount,
+            unit_amount: finalAmount,
           },
           quantity: 1,
         },
@@ -251,6 +320,7 @@ app.post("/create-checkout-session", async (req, res) => {
         customerEmail: customer?.email || "",
         customerPhone: customer?.phone || "",
         items: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+        memberDiscountApplied: discountApplied ? "1" : "0",
       },
       success_url: successUrl,
       cancel_url: cancelUrl,
@@ -283,6 +353,8 @@ app.post("/create-checkout-session", async (req, res) => {
           customerName: customer?.name || "",
           customerEmail: customer?.email || "",
           customerPhone: customer?.phone || "",
+          memberDiscountApplied: discountApplied,
+          memberDiscountCents: discountCents,
           createdAt: new Date().toISOString(),
         });
       } catch (e) {
@@ -290,10 +362,34 @@ app.post("/create-checkout-session", async (req, res) => {
       }
     }
 
-    res.json({ url: session.url, sessionId: session.id });
+    res.json({ url: session.url, sessionId: session.id, discountApplied, discountCents, finalAmount });
   } catch (err) {
     console.error("create-checkout-session failed:", err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Withdraws marketing consent (not the membership/discount record itself
+// — someone can stop wanting promos while remaining a member). No login
+// required, matching how any unsubscribe link needs to work — but it
+// only ever flips one boolean on the caller's own record, nothing else
+// is readable or writable through this route. Always returns success
+// even if the email isn't a member, so this can't be used to check
+// which emails are registered.
+app.post("/members/unsubscribe", async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const email = normalizeEmail(req.body.email);
+    if (!email) return res.status(400).json({ error: "Email required." });
+    const ref = db.collection("members").doc(email);
+    const doc = await ref.get();
+    if (doc.exists) {
+      await ref.set({ marketingConsent: false, marketingWithdrawnAt: new Date().toISOString() }, { merge: true });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("members/unsubscribe failed:", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
@@ -713,6 +809,232 @@ app.post("/upload", async (req, res) => {
     res.json({ url });
   } catch (e) {
     console.error("upload failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+/* =========================================================================
+   AUTH — Phase 1: user accounts, login, and token issuing/verification.
+
+   Three roles:
+     - "outlet": scope = one outlet id — sees only that outlet's data
+     - "group":  scope = one chain name (e.g. "WFA Asia") — sees every
+                 outlet under that chain
+     - "master": scope = null — sees everything, every chain/outlet
+
+   Phase 2 will apply requireAuth + scope filtering to the existing data
+   endpoints (/orders, /store/:key, etc). This phase only builds the
+   foundation: accounts, login, and a way to verify who's asking — the
+   dashboard's old client-side `pin === "1234"` check (a plain string
+   sitting in public JS, readable by anyone, checked nowhere on the
+   server) is being replaced entirely.
+
+   Passwords are hashed with scrypt — Node's built-in, no extra npm
+   dependency, and memory-hard, so it's expensive to brute-force even if
+   the Firestore data were ever exposed. Never stored or logged in plain
+   text. Tokens are a minimal hand-rolled signed-payload scheme (HMAC-
+   SHA256 over a base64url JSON body) rather than pulling in a full JWT
+   library — same underlying idea as a JWT, intentionally smaller and
+   fully auditable in this one file rather than a black-box dependency.
+========================================================================= */
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, hash] = (stored || "").split(":");
+  if (!salt || !hash) return false;
+  const candidateHash = crypto.scryptSync(password, salt, 64).toString("hex");
+  // Constant-time comparison on purpose — a plain === leaks timing
+  // information that can help an attacker guess the hash byte by byte.
+  const a = Buffer.from(hash, "hex");
+  const b = Buffer.from(candidateHash, "hex");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+const AUTH_TOKEN_SECRET =
+  process.env.AUTH_TOKEN_SECRET ||
+  (() => {
+    console.warn(
+      "[warning] AUTH_TOKEN_SECRET not set — generating a temporary one for this process. " +
+        "Every logged-in session will be invalidated on the next restart/redeploy. Set a " +
+        "persistent AUTH_TOKEN_SECRET env var before relying on this in production."
+    );
+    return crypto.randomBytes(32).toString("hex");
+  })();
+
+const TOKEN_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+function signToken(payload) {
+  const body = { ...payload, exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS };
+  const encoded = Buffer.from(JSON.stringify(body)).toString("base64url");
+  const signature = crypto.createHmac("sha256", AUTH_TOKEN_SECRET).update(encoded).digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyToken(token) {
+  if (!token) return null;
+  const [encoded, signature] = token.split(".");
+  if (!encoded || !signature) return null;
+  const expected = crypto.createHmac("sha256", AUTH_TOKEN_SECRET).update(encoded).digest("base64url");
+  const a = Buffer.from(signature);
+  const b = Buffer.from(expected);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(encoded, "base64url").toString());
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null; // expired
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+// Attach this to any route that requires someone to be logged in.
+// req.authUser is then available: { userId, role, scope, name }.
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const payload = verifyToken(token);
+  if (!payload) return res.status(401).json({ error: "Not signed in, or your session has expired — please log in again." });
+  req.authUser = payload;
+  next();
+}
+
+function requireMaster(req, res, next) {
+  if (req.authUser?.role !== "master") return res.status(403).json({ error: "Master account required." });
+  next();
+}
+
+function normalizeEmail(email) {
+  return String(email || "").trim().toLowerCase();
+}
+
+app.post("/auth/login", async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured — user accounts require Firestore." });
+  try {
+    const email = normalizeEmail(req.body.email);
+    const password = req.body.password || "";
+    if (!email || !password) return res.status(400).json({ error: "Email and password required." });
+
+    const doc = await db.collection("users").doc(email).get();
+    // Same generic error whether the account doesn't exist or the
+    // password is wrong — confirming "that email isn't registered" to
+    // an anonymous caller is a small but real information leak.
+    if (!doc.exists) return res.status(401).json({ error: "Invalid email or password." });
+    const user = doc.data();
+    if (user.disabled) return res.status(401).json({ error: "This account has been disabled." });
+    if (!verifyPassword(password, user.passwordHash)) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+
+    const token = signToken({ userId: email, role: user.role, scope: user.scope ?? null, name: user.name || email });
+    res.json({ token, role: user.role, scope: user.scope ?? null, name: user.name || email });
+  } catch (e) {
+    console.error("login failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/auth/me", requireAuth, (req, res) => {
+  res.json({ userId: req.authUser.userId, role: req.authUser.role, scope: req.authUser.scope, name: req.authUser.name });
+});
+
+// One-time bootstrap — creates the very first master account. Refuses
+// to run if ANY user already exists, so it can't create a second
+// master account later. Also gated behind the existing admin key (not
+// just the "empty users collection" check) so there's no window after
+// deploying where a stranger who happens to find this URL first could
+// register themselves as master before the real owner does.
+app.post("/auth/bootstrap-master", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const existing = await db.collection("users").limit(1).get();
+    if (!existing.empty) {
+      return res.status(403).json({ error: "Setup already complete — a user account already exists. Use POST /auth/users (while logged in as master) to add more." });
+    }
+    const email = normalizeEmail(req.body.email);
+    const password = req.body.password || "";
+    const name = req.body.name || "Master";
+    if (!email || password.length < 8) {
+      return res.status(400).json({ error: "Email and a password of at least 8 characters are required." });
+    }
+    await db.collection("users").doc(email).set({
+      email, name, role: "master", scope: null,
+      passwordHash: hashPassword(password),
+      createdAt: new Date().toISOString(),
+    });
+    const token = signToken({ userId: email, role: "master", scope: null, name });
+    res.json({ token, role: "master", scope: null, name });
+  } catch (e) {
+    console.error("bootstrap-master failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Master creates any account: an outlet login (scope = outlet id), a
+// group login (scope = chain name, e.g. "WFA Asia"), or another master.
+app.post("/auth/users", requireAuth, requireMaster, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const email = normalizeEmail(req.body.email);
+    const password = req.body.password || "";
+    const name = req.body.name || email;
+    const role = req.body.role; // "outlet" | "group" | "master"
+    const scope = role === "master" ? null : req.body.scope;
+    if (!email || password.length < 8) {
+      return res.status(400).json({ error: "Email and a password of at least 8 characters are required." });
+    }
+    if (!["outlet", "group", "master"].includes(role)) {
+      return res.status(400).json({ error: 'role must be "outlet", "group", or "master".' });
+    }
+    if (role !== "master" && !scope) {
+      return res.status(400).json({ error: "scope is required for outlet/group accounts — an outlet id or a chain name." });
+    }
+    const existing = await db.collection("users").doc(email).get();
+    if (existing.exists) return res.status(409).json({ error: "An account with this email already exists." });
+
+    await db.collection("users").doc(email).set({
+      email, name, role, scope,
+      passwordHash: hashPassword(password),
+      createdAt: new Date().toISOString(),
+      createdBy: req.authUser.userId,
+    });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("create user failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get("/auth/users", requireAuth, requireMaster, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const snap = await db.collection("users").get();
+    const users = snap.docs.map((d) => {
+      const { passwordHash, ...safe } = d.data(); // never send hashes back, even to master
+      return safe;
+    });
+    res.json({ users });
+  } catch (e) {
+    console.error("list users failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.delete("/auth/users/:email", requireAuth, requireMaster, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const email = normalizeEmail(req.params.email);
+    if (email === req.authUser.userId) {
+      return res.status(400).json({ error: "You can't delete your own account while logged in as it." });
+    }
+    await db.collection("users").doc(email).delete();
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("delete user failed:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
