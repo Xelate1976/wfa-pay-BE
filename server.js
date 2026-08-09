@@ -395,6 +395,27 @@ async function sendWhatsAppViaGreenAPI(instanceId, apiToken, toNumber, text) {
   }
 }
 
+// Telegram — no device linking, no expiring QR codes, just a bot token
+// + chat id. Generally more reliable than the Green-API/WhatsApp path
+// above for this exact reason; offered as an additional channel rather
+// than a replacement, since some staff will still only check WhatsApp.
+async function sendTelegramMessage(botToken, chatId, text) {
+  if (!botToken || !chatId) return;
+  try {
+    const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!res.ok) {
+      console.error(`Telegram send failed (${res.status}):`, await res.text());
+    }
+  } catch (e) {
+    console.error("Telegram send failed:", e.message);
+  }
+}
+
 /* ---------------------------------------------------------------------
    Per-outlet WhatsApp credentials — stored in their OWN Firestore
    collection (outletSecrets), never in the public "wfa-outlets"
@@ -483,6 +504,40 @@ app.get("/outlet-secrets/:outletId/wa-status", requireAdminKey, async (req, res)
   }
 });
 
+// Convenience helper: Telegram has no "linking" step like WhatsApp, but
+// finding a chat's numeric ID is the one genuinely fiddly part of
+// setting up a bot. After saving a bot token and sending the bot any
+// message from the target chat, this looks that chat id up
+// automatically via Telegram's getUpdates, instead of needing to open
+// Telegram's raw API in a browser and read the JSON by hand.
+app.get("/outlet-secrets/:outletId/telegram-chat-id", requireAdminKey, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured" });
+  try {
+    const doc = await db.collection("outletSecrets").doc(req.params.outletId).get();
+    const s = doc.exists ? doc.data() : {};
+    if (!s.telegramBotToken) {
+      return res.status(400).json({ error: "Save this outlet's Telegram Bot Token first, then message the bot once before trying this." });
+    }
+    const url = `https://api.telegram.org/bot${s.telegramBotToken}/getUpdates`;
+    const tgRes = await fetch(url);
+    const data = await tgRes.json();
+    const updates = data.result || [];
+    if (updates.length === 0) {
+      return res.status(404).json({ error: "No messages found yet — open Telegram, find your bot, and send it any message, then try again." });
+    }
+    const last = updates[updates.length - 1];
+    const chatId = last.message?.chat?.id ?? last.channel_post?.chat?.id;
+    const chatTitle = last.message?.chat?.title || last.message?.chat?.username || last.message?.chat?.first_name || "this chat";
+    if (chatId === undefined) {
+      return res.status(404).json({ error: "Couldn't find a chat ID in the latest message — try messaging the bot again." });
+    }
+    res.json({ chatId: String(chatId), chatTitle });
+  } catch (e) {
+    console.error("telegram-chat-id lookup failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ---------------------------------------------------------------------
    Notifications — fill in your real credentials in .env. Each block is
    independently optional: if the relevant env vars are missing, that
@@ -502,6 +557,8 @@ async function notifyOnPayment({ amountCents, metadata }) {
   let waApiToken = process.env.GREENAPI_API_TOKEN;
   let merchantNumber = process.env.MERCHANT_WHATSAPP_NUMBER;
   let supplierNumber = process.env.SUPPLIER_WHATSAPP_NUMBER;
+  let telegramBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  let telegramChatId = process.env.TELEGRAM_CHAT_ID;
 
   if (db && outlet) {
     try {
@@ -512,9 +569,11 @@ async function notifyOnPayment({ amountCents, metadata }) {
         waApiToken = s.greenApiApiToken || waApiToken;
         merchantNumber = s.notifyWhatsAppNumber || merchantNumber;
         supplierNumber = s.supplierWhatsAppNumber || supplierNumber;
+        telegramBotToken = s.telegramBotToken || telegramBotToken;
+        telegramChatId = s.telegramChatId || telegramChatId;
       }
     } catch (e) {
-      console.error(`Failed to load WhatsApp config for outlet "${outlet}", falling back to shared credentials:`, e.message);
+      console.error(`Failed to load notification config for outlet "${outlet}", falling back to shared credentials:`, e.message);
     }
   }
 
@@ -538,6 +597,18 @@ async function notifyOnPayment({ amountCents, metadata }) {
     }
   } else {
     console.log(`[skipped] WhatsApp not configured for outlet "${outlet || "(none)"}" and no shared GREENAPI_* fallback set`);
+  }
+
+  // --- Telegram (additional channel — no device linking, more reliable
+  //     than WhatsApp Web for this exact reason) -------------------------
+  if (telegramBotToken && telegramChatId) {
+    await sendTelegramMessage(
+      telegramBotToken,
+      telegramChatId,
+      `💰 New order paid${table ? ` — Table ${table}` : ""} — $${total}\n${items || ""}`
+    );
+  } else {
+    console.log(`[skipped] Telegram not configured for outlet "${outlet || "(none)"}" and no shared TELEGRAM_* fallback set`);
   }
 
   // --- Email via Resend --------------------------------------------------
