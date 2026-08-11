@@ -142,18 +142,85 @@ app.use(cors({
 // fire just harmlessly overwrites the same record rather than
 // creating a duplicate. Safe to call from both the webhook and
 // /order-paid; whichever runs first wins, the other is a no-op.
+// Order numbers are a permanent, human-friendly reference — separate
+// from the internal Stripe session id, which is unique but useless to
+// say out loud or write on a receipt. Per-outlet, continuously
+// incrementing, never resets. Queue numbers are the opposite: a small,
+// easy-to-call-out number for takeaway/events, only assigned while
+// that outlet's queueModeEnabled flag is on, and reset to 1 every time
+// queue mode gets switched on (see the outlet toggle in the frontend).
+//
+// A Firestore transaction is what makes this safe under concurrent
+// orders — the same reasoning as markNotifiedOnce() above: a plain
+// read-increment-write has a race window where two nearly-simultaneous
+// orders could both read the same "current" number and both increment
+// from there, handing out a duplicate.
+async function assignOrderAndQueueNumbers(outletId) {
+  if (!db) return { orderNumber: null, queueNumber: null };
+  const counterRef = db.collection("counters").doc(outletId || "_no_outlet");
+  const outletsRef = db.collection("kv").doc("wfa-outlets");
+  try {
+    return await db.runTransaction(async (t) => {
+      // All reads before any writes — Firestore transaction requirement.
+      const counterDoc = await t.get(counterRef);
+      const outletsDoc = outletId ? await t.get(outletsRef) : null;
+
+      const current = counterDoc.exists ? counterDoc.data() : {};
+      const nextOrderSeq = (current.orderSeq || 0) + 1;
+
+      let queueEnabled = false;
+      if (outletId && outletsDoc?.exists) {
+        const outlet = (outletsDoc.data().value || []).find((o) => o.id === outletId);
+        queueEnabled = !!outlet?.queueModeEnabled;
+      }
+
+      let queueNumber = null;
+      let nextQueueSeq = current.queueSeq || 0;
+      if (queueEnabled) {
+        nextQueueSeq += 1;
+        queueNumber = nextQueueSeq;
+      }
+
+      t.set(counterRef, { orderSeq: nextOrderSeq, queueSeq: nextQueueSeq }, { merge: true });
+      return { orderNumber: nextOrderSeq, queueNumber };
+    });
+  } catch (e) {
+    console.error(`assignOrderAndQueueNumbers failed for outlet ${outletId}:`, e.message);
+    return { orderNumber: null, queueNumber: null };
+  }
+}
+
 async function recordOrderFromSession(session) {
-  if (!db) return;
+  if (!db) return { orderNumber: null, queueNumber: null };
   try {
     const pendingDoc = await db.collection("checkoutPending").doc(session.id).get();
     if (!pendingDoc.exists) {
       console.error(`recordOrderFromSession: no checkoutPending record for ${session.id} — order may only exist if the guest's browser completed the return trip.`);
-      return;
+      return { orderNumber: null, queueNumber: null };
     }
     const p = pendingDoc.data();
+
+    // Idempotency: the webhook and /order-paid both call this function
+    // for the same order. If it's already been recorded with a number,
+    // reuse it rather than generating a fresh one — otherwise a race
+    // between the two paths could burn two numbers for one order
+    // (harmless — just a skipped number in the sequence — but avoidable).
+    const existingDoc = await db.collection("orders").doc(session.id).get();
+    let orderNumber, queueNumber;
+    if (existingDoc.exists && existingDoc.data().orderNumber) {
+      orderNumber = existingDoc.data().orderNumber;
+      queueNumber = existingDoc.data().queueNumber ?? null;
+    } else {
+      const assigned = await assignOrderAndQueueNumbers(p.outlet);
+      orderNumber = assigned.orderNumber;
+      queueNumber = assigned.queueNumber;
+    }
+
     const order = {
       id: session.id,
       ts: p.createdAt || new Date().toISOString(),
+      orderNumber,
+      queueNumber,
       items: p.items || [],
       total: +(session.amount_total / 100).toFixed(2),
       subtotal: p.subtotal,
@@ -168,8 +235,10 @@ async function recordOrderFromSession(session) {
       live: true,
     };
     await db.collection("orders").doc(session.id).set(order);
+    return { orderNumber, queueNumber };
   } catch (e) {
     console.error("recordOrderFromSession failed:", e.message);
+    return { orderNumber: null, queueNumber: null };
   }
 }
 
@@ -427,8 +496,8 @@ app.post("/order-paid", async (req, res) => {
     }
 
     await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata, sessionId });
-    await recordOrderFromSession(session);
-    res.json({ ok: true });
+    const { orderNumber, queueNumber } = await recordOrderFromSession(session);
+    res.json({ ok: true, orderNumber, queueNumber });
   } catch (err) {
     console.error("order-paid failed:", err.message);
     res.status(500).json({ error: err.message });
@@ -1062,7 +1131,7 @@ app.get("/store/:key", async (req, res) => {
   res.json({ value: entry });
 });
 
-app.post("/store/:key", async (req, res) => {
+app.post("/store/:key", requireAuth, async (req, res) => {
   const key = req.params.key;
   if (db) {
     try {
@@ -1091,16 +1160,49 @@ app.post("/store/:key", async (req, res) => {
    close together both survive no matter which one's request finishes
    first.
 --------------------------------------------------------------------- */
-app.get("/orders", async (_req, res) => {
+// Resolves whether a logged-in user is allowed to see a given order,
+// based on their role/scope. Needs the outlets list to translate a
+// group admin's chain scope into actual outlet ids.
+function userCanSeeOutlet(authUser, outletId, outletsList) {
+  if (!authUser) return false;
+  if (authUser.role === "master") return true;
+  if (authUser.role === "outlet") return authUser.scope === outletId;
+  if (authUser.role === "group") {
+    const outlet = (outletsList || []).find((o) => o.id === outletId);
+    return !!outlet && (outlet.chain || "Independent") === authUser.scope;
+  }
+  return false;
+}
+
+// Soft auth, not requireAuth — this endpoint is called both by the
+// merchant dashboard (needs real, scoped order data) AND by the
+// customer-facing ordering page on every load (as part of the initial
+// demo-data seed check, long before anyone might log into anything).
+// Rather than 401 the customer side, an anonymous/invalid token just
+// gets back an empty list — correct either way, since a guest browsing
+// the menu has no legitimate reason to see order data regardless.
+app.get("/orders", async (req, res) => {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const authUser = verifyToken(token);
+  if (!authUser) return res.json({ orders: [] });
+
   if (db) {
     try {
       const snap = await db.collection("orders").orderBy("ts", "desc").limit(1000).get();
-      return res.json({ orders: snap.docs.map((d) => d.data()) });
+      let orders = snap.docs.map((d) => d.data());
+      if (authUser.role !== "master") {
+        const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+        const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+        orders = orders.filter((o) => userCanSeeOutlet(authUser, o.outlet, outletsList));
+      }
+      return res.json({ orders });
     } catch (e) {
       console.error("Firestore orders fetch failed:", e.message);
       return res.status(500).json({ error: e.message });
     }
   }
+  if (authUser.role !== "master") return res.json({ orders: [] }); // no Firestore = no way to scope in-memory data by outlet
   res.json({ orders: memOrders });
 });
 
@@ -1109,7 +1211,15 @@ app.post("/orders", async (req, res) => {
   if (!order || !order.id) return res.status(400).json({ error: "order required" });
   if (db) {
     try {
-      await db.collection("orders").doc(order.id).set(order);
+      // merge:true matters here specifically — this is the guest's OWN
+      // browser pushing its own copy of the order (a fallback for
+      // instant UI feedback), which has no idea about orderNumber/
+      // queueNumber (those only exist once the webhook/order-paid path
+      // assigns them server-side). A plain .set() would silently erase
+      // whichever of those already got written, if this call happens
+      // to land second. merge:true means whichever fields each caller
+      // knows about get applied, without wiping what the other wrote.
+      await db.collection("orders").doc(order.id).set(order, { merge: true });
       return res.json({ ok: true });
     } catch (e) {
       console.error("Firestore order write failed:", e.message);
@@ -1123,6 +1233,23 @@ app.post("/orders", async (req, res) => {
 // Only used once, to load the initial 90 days of demo history — guarded
 // so it can't accidentally wipe real orders that have already come in,
 // and so two devices loading for the first time at once don't both seed.
+// Resets an outlet's queue number back to 1 (technically: the counter
+// back to 0, so the NEXT order becomes #1) — called by the frontend
+// every time queue mode gets switched from off to on, so each new
+// takeaway/event session starts fresh rather than continuing whatever
+// number a previous session left off at. Deliberately doesn't touch
+// orderSeq — the permanent order-number sequence never resets.
+app.post("/counters/:outletId/reset-queue", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    await db.collection("counters").doc(req.params.outletId).set({ queueSeq: 0 }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("reset-queue failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post("/orders/seed", async (req, res) => {
   const { orders } = req.body;
   const toSeed = Array.isArray(orders) ? orders : [];
@@ -1153,7 +1280,19 @@ app.post("/orders/seed", async (req, res) => {
   res.json({ ok: true, count: memOrders.length });
 });
 
-app.get("/notifications", async (_req, res) => {
+// Same soft-auth reasoning as /orders above — called from the same
+// initial-load code path on both the customer and merchant sides.
+// Notifications aren't currently tagged with an outlet id in their own
+// data (unlike orders), so this stops at "any valid login sees all of
+// them" rather than full per-outlet scoping — a real gap worth closing
+// in a future pass by tagging each notification with its outlet at
+// write time, but out of scope for this one.
+app.get("/notifications", async (req, res) => {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  const authUser = verifyToken(token);
+  if (!authUser) return res.json({ notifications: [] });
+
   if (db) {
     try {
       const snap = await db.collection("notifications").orderBy("ts", "desc").limit(40).get();
