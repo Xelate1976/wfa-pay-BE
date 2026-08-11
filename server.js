@@ -504,6 +504,271 @@ app.post("/order-paid", async (req, res) => {
   }
 });
 
+// POS — staff-entered cash orders. No Stripe involved at all (no
+// checkout session, no card, no webhook) — for walk-up/dine-in
+// customers paying cash, entered directly by a logged-in staff member.
+// Everything else works exactly like an online order: same order
+// numbering, same membership discount logic, same notifications, same
+// Reports/Charts — distinguished only by paymentMethod: "cash" and
+// staffUser (who actually rang it up, for real accountability rather
+// than a generic "walk-in" bucket).
+app.post("/pos/complete-order", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const { outlet, table, items, subtotal, serviceCharge, gst, total, customer, wantsMembership, marketingConsent } = req.body;
+
+    if (!outlet) return res.status(400).json({ error: "outlet is required." });
+    if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required." });
+    if (!Number.isFinite(total) || total <= 0) return res.status(400).json({ error: "Invalid total." });
+
+    // Same scoping rule as viewing orders — a staff login can only
+    // complete a POS sale for an outlet they're actually allowed to
+    // see. Master/group can do it for any outlet within their scope.
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to complete orders for this outlet." });
+    }
+
+    // Membership discount — same server-side, transaction-guarded logic
+    // as online checkout (see /create-checkout-session), just with no
+    // Stripe amount to adjust — the discount is applied directly to the
+    // recorded total instead.
+    let finalTotal = total;
+    let discountApplied = false;
+    const email = normalizeEmail(customer?.email);
+    if (wantsMembership && email) {
+      try {
+        const memberRef = db.collection("members").doc(email);
+        discountApplied = await db.runTransaction(async (t) => {
+          const doc = await t.get(memberRef);
+          const alreadyUsed = doc.exists && doc.data().firstOrderDiscountUsed;
+          if (alreadyUsed) {
+            if (typeof marketingConsent === "boolean") {
+              t.set(memberRef, { marketingConsent, marketingConsentUpdatedAt: new Date().toISOString() }, { merge: true });
+            }
+            return false;
+          }
+          t.set(memberRef, {
+            email,
+            name: customer?.name || "",
+            phone: customer?.phone || "",
+            joinedAt: doc.exists ? doc.data().joinedAt : new Date().toISOString(),
+            firstOrderDiscountUsed: true,
+            firstOrderDiscountUsedAt: new Date().toISOString(),
+            marketingConsent: !!marketingConsent,
+            consentGivenAt: new Date().toISOString(),
+            consentVersion: MEMBERSHIP_CONSENT_VERSION,
+          }, { merge: true });
+          return true;
+        });
+        if (discountApplied) finalTotal = +(total * 0.9).toFixed(2);
+      } catch (e) {
+        console.error(`POS membership discount check failed for ${email}, proceeding without discount:`, e.message);
+      }
+    }
+
+    const { orderNumber, queueNumber } = await assignOrderAndQueueNumbers(outlet);
+
+    const id = `pos-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const order = {
+      id,
+      ts: new Date().toISOString(),
+      orderNumber,
+      queueNumber,
+      items,
+      total: finalTotal,
+      subtotal: subtotal ?? null,
+      serviceCharge: serviceCharge ?? null,
+      gst: gst ?? null,
+      customer: customer?.name || "Walk-in",
+      email: customer?.email || "",
+      phone: customer?.phone || "",
+      outlet,
+      table: table || null,
+      sessionId: null,
+      live: true,
+      paymentMethod: "cash",
+      staffUser: req.authUser.userId,
+      memberDiscountApplied: discountApplied,
+    };
+    await db.collection("orders").doc(id).set(order);
+
+    await notifyOnPayment({
+      amountCents: Math.round(finalTotal * 100),
+      metadata: {
+        table: table ? String(table) : "",
+        outlet: String(outlet),
+        customerEmail: customer?.email || "",
+        items: items.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+      },
+      sessionId: id,
+    });
+
+    res.json({ ok: true, orderNumber, queueNumber, total: finalTotal, discountApplied });
+  } catch (e) {
+    console.error("pos/complete-order failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Marks one order "ready" — this is now the single source of truth for
+// what's still active on any Live Orders screen (dashboard tab or the
+// standalone kiosk site). Previously "dismiss" was a purely local,
+// per-device thing (localStorage) — meaning two screens open at once
+// could disagree about what's still pending. A real server-side status
+// fixes that, and doubles as what powers the public Order Ready board.
+app.post("/orders/:id/mark-ready", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const ref = db.collection("orders").doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, order.outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to this order." });
+    }
+
+    await ref.set({ ready: true, readyAt: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("mark-ready failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Bulk version — powers "Clear all" on Live Orders. Marks every
+// currently-not-ready order for an outlet, today, ready in one request
+// instead of one call per order.
+app.post("/orders/mark-all-ready", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const { outlet } = req.body;
+    if (!outlet) return res.status(400).json({ error: "outlet is required." });
+
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to this outlet." });
+    }
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const snap = await db.collection("orders")
+      .where("outlet", "==", outlet)
+      .where("ts", ">=", startOfDay.toISOString())
+      .get();
+
+    const batch = db.batch();
+    const readyAt = new Date().toISOString();
+    let count = 0;
+    snap.docs.forEach((d) => {
+      if (!d.data().ready) {
+        batch.set(d.ref, { ready: true, readyAt }, { merge: true });
+        count++;
+      }
+    });
+    await batch.commit();
+    res.json({ ok: true, count });
+  } catch (e) {
+    console.error("mark-all-ready failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Deliberately PUBLIC — no login required. This is what the customer-
+// facing Order Ready board reads, so unlike every other order-related
+// endpoint it must NEVER return customer name, email, phone, or items —
+// only what's safe for anyone walking past a screen to see: the order
+// number, queue number, and when it became ready. Only recently-ready
+// orders are returned (last 30 minutes) so the board doesn't accumulate
+// stale entries forever — this is the only real "expiry" mechanism, so
+// it deliberately isn't configurable per outlet right now.
+app.get("/orders/ready-board", async (req, res) => {
+  if (!db) return res.json({ ready: [] });
+  try {
+    const { outlet } = req.query;
+    if (!outlet) return res.status(400).json({ error: "outlet query param is required." });
+
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    const snap = await db.collection("orders")
+      .where("outlet", "==", outlet)
+      .where("ready", "==", true)
+      .where("readyAt", ">=", cutoff)
+      .get();
+
+    const ready = snap.docs
+      .map((d) => d.data())
+      .map((o) => ({ orderNumber: o.orderNumber ?? null, queueNumber: o.queueNumber ?? null, readyAt: o.readyAt }))
+      .sort((a, b) => new Date(b.readyAt) - new Date(a.readyAt));
+    res.json({ ready });
+  } catch (e) {
+    console.error("ready-board fetch failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Staff taps "Ready" on the Live Orders screen — marks the order ready
+// for pickup, which is what makes it appear on the public Order Ready
+// board below. requireAuth (not public) since this is a staff action;
+// also checks the same outlet scoping as everywhere else, so an outlet
+// login can't mark another outlet's orders ready.
+app.post("/orders/:id/ready", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const doc = await db.collection("orders").doc(req.params.id).get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, order.outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to this order." });
+    }
+
+    await doc.ref.set({ status: "ready", readyAt: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("mark-ready failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// The public Order Ready board — deliberately NO login required, since
+// this is a customer-facing display, not a staff tool. Deliberately
+// minimal fields too: just order/queue number and when it went ready —
+// never items, prices, names, or anything else a public unauthenticated
+// endpoint shouldn't be handing out. Auto-expires after 30 minutes so
+// forgotten/uncollected orders don't clutter the board forever.
+app.get("/ready-orders/:outletId", async (req, res) => {
+  if (!db) return res.json({ orders: [] });
+  try {
+    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    // Deliberately no .orderBy() here — combining it with the two
+    // equality filters below would require manually creating a
+    // composite index in Firestore before this query works at all
+    // (it just errors otherwise). Sorting the small resulting list in
+    // plain JS avoids that deployment step entirely.
+    const snap = await db.collection("orders")
+      .where("outlet", "==", req.params.outletId)
+      .where("status", "==", "ready")
+      .limit(50)
+      .get();
+    const orders = snap.docs
+      .map((d) => d.data())
+      .filter((o) => o.readyAt && o.readyAt >= cutoff)
+      .sort((a, b) => new Date(b.readyAt) - new Date(a.readyAt))
+      .map((o) => ({ orderNumber: o.orderNumber, queueNumber: o.queueNumber, readyAt: o.readyAt }));
+    res.json({ orders });
+  } catch (e) {
+    console.error("ready-orders fetch failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 /* ---------------------------------------------------------------------
    Plain landing pages Stripe redirects the Checkout tab to. The guest
    sees this in the tab Checkout opened in — they can close it and
