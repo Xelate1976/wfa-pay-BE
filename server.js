@@ -3,7 +3,7 @@
  * -----------------------------------------------------------------------
  * Minimal Express server that:
  *   1. Creates a Stripe Checkout Session for a cart total and hands back
- *      its hosted URL. The App opens that URL in a new browser tab —
+ *      its hosted URL. The app opens that URL in a new browser tab —
  *      Stripe's own page collects the card, so no card-handling code or
  *      script ever needs to load inside the ordering app itself.
  *   2. Lets the app poll a session's status after opening it (since the
