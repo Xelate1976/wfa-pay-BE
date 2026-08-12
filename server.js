@@ -30,6 +30,7 @@ import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
 import { Storage } from "@google-cloud/storage";
 import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 
 dotenv.config();
 
@@ -133,6 +134,41 @@ app.use(cors({
     callback(new Error(`CORS: origin "${origin}" is not in ALLOWED_ORIGIN`));
   },
 }));
+
+/* =========================================================================
+   RATE LIMITING
+
+   Two tiers. A strict one for anything that's a real brute-force target
+   (login, the one-time master bootstrap) — without this, /auth/login had
+   zero throttling, meaning a script could try passwords as fast as the
+   network allowed. A much looser one for everything else, mainly to
+   guard against basic scripted abuse driving up Cloud Run's per-request
+   billing rather than any specific attack.
+
+   Cloud Run sits behind Google's own load balancer, so requests arrive
+   with X-Forwarded-For set correctly — `trust proxy` is required for
+   express-rate-limit to key on the real client IP instead of Google's
+   proxy IP (which would otherwise make every request look like it came
+   from the same "user").
+========================================================================= */
+app.set("trust proxy", 1);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // 10 attempts per IP per window — enough for a real person who mistypes a password a few times, nowhere near enough for a brute-force script
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many attempts — please wait a few minutes and try again." },
+});
+
+const generalLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 minute
+  max: 120, // generous — real usage (polling Live Orders every 5s, customers browsing) stays well under this
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests — please slow down." },
+});
+app.use(generalLimiter);
 
 // The reliable path: looks up what was saved at checkout-creation time
 // (see /create-checkout-session) and writes it into the real orders
@@ -293,15 +329,169 @@ app.use(express.json({ limit: "25mb" }));
 // the notice someone actually agreed to, in case that's ever disputed.
 const MEMBERSHIP_CONSENT_VERSION = "2026-08-09";
 
+/* =========================================================================
+   SERVER-SIDE PRICE VERIFICATION
+
+   Until this point, the checkout amount (and POS total) came straight
+   from req.body — the client computed a price and the backend just
+   charged whatever number showed up. That's a real gap: a modified
+   request could set any price at all, since nothing here ever checked
+   it against the actual menu.
+
+   Everything below re-derives the real price server-side, from the
+   real menu and real tax settings in Firestore, using the exact same
+   math as the frontend's computeOrderTotals() — the client-sent
+   amount/subtotal/serviceCharge/gst/total are now only ever used for
+   comparison/logging, never trusted for what actually gets charged.
+========================================================================= */
+
+const DEFAULT_CHAIN = "WFA Asia";
+const DEFAULT_TAX_SETTINGS = { gstEnabled: false, gstRate: 9, gstMode: "exclusive", serviceChargeEnabled: false, serviceChargeRate: 10 };
+
+// Exact port of the frontend's computeOrderTotals() — same rounding,
+// same "++" F&B pricing logic (service charge on subtotal, GST on
+// subtotal+service charge). Kept in sync deliberately; if one changes,
+// the other must too, or client-displayed and server-charged totals
+// will silently disagree.
+function computeOrderTotals(subtotal, tax) {
+  const t = tax || DEFAULT_TAX_SETTINGS;
+  const serviceCharge = t.serviceChargeEnabled ? +(subtotal * (Number(t.serviceChargeRate) || 0) / 100).toFixed(2) : 0;
+  const gstBase = subtotal + serviceCharge;
+  const rate = Number(t.gstRate) || 0;
+  let gst = 0;
+  let gstInclusiveAmount = 0;
+  if (t.gstEnabled && rate > 0) {
+    if (t.gstMode === "inclusive") {
+      gstInclusiveAmount = +(gstBase - gstBase / (1 + rate / 100)).toFixed(2);
+    } else {
+      gst = +(gstBase * (rate / 100)).toFixed(2);
+    }
+  }
+  return {
+    subtotal, serviceCharge, gst, gstInclusiveAmount,
+    total: +(gstBase + gst).toFixed(2),
+    gstEnabled: !!t.gstEnabled, gstMode: t.gstMode === "inclusive" ? "inclusive" : "exclusive", gstRate: rate,
+    serviceChargeEnabled: !!t.serviceChargeEnabled, serviceChargeRate: Number(t.serviceChargeRate) || 0,
+  };
+}
+
+// Real menu for a given outlet: chain catalog + that outlet's own price
+// overrides + availability — same merge logic as the frontend's
+// menuForOutlet()/posMenuForOutlet(), just re-derived here so pricing
+// can never be verified against anything other than what's actually
+// configured right now.
+async function resolveEffectiveMenuForOutlet(outletId) {
+  const [outletsDoc, menuByChainDoc, overridesDoc] = await Promise.all([
+    db.collection("kv").doc("wfa-outlets").get(),
+    db.collection("kv").doc("wfa-menu-by-chain").get(),
+    db.collection("kv").doc("wfa-menu-overrides").get(),
+  ]);
+  const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+  const menuByChain = menuByChainDoc.exists ? menuByChainDoc.data().value || {} : {};
+  const menuOverrides = overridesDoc.exists ? overridesDoc.data().value || {} : {};
+
+  const chain = outletId ? outletsList.find((o) => o.id === outletId)?.chain : DEFAULT_CHAIN;
+  const list = menuByChain[chain || DEFAULT_CHAIN] || [];
+  const outletOverrides = outletId ? menuOverrides[outletId] : null;
+  const merged = !outletOverrides ? list : list.map((item) => {
+    const o = outletOverrides[item.id];
+    if (!o) return item;
+    return {
+      ...item,
+      active: o.active === false ? false : item.active,
+      glass: o.glass !== undefined && o.glass !== "" ? Number(o.glass) : item.glass,
+      bottle: o.bottle !== undefined && o.bottle !== "" ? Number(o.bottle) : item.bottle,
+    };
+  });
+  return { menu: merged, chain: chain || DEFAULT_CHAIN };
+}
+
+// Re-prices a cart against the real menu. Any item that doesn't exist,
+// is inactive, or has a modifier id that doesn't actually belong to
+// that item is rejected outright — a mismatched cart is a sign
+// something's wrong (deleted item, tampered request), not something to
+// silently patch over and charge for anyway.
+async function computeVerifiedSubtotal(outletId, items) {
+  const { menu } = await resolveEffectiveMenuForOutlet(outletId);
+  let subtotal = 0;
+  const verifiedItems = [];
+
+  for (const line of items || []) {
+    const qty = Number(line.qty);
+    if (!Number.isInteger(qty) || qty <= 0 || qty > 500) {
+      throw new Error(`Invalid quantity for "${line.name || line.id}".`);
+    }
+    const menuItem = menu.find((m) => m.id === line.id);
+    if (!menuItem) throw new Error(`"${line.name || line.id}" is no longer on the menu.`);
+    if (menuItem.active === false) throw new Error(`"${menuItem.name}" is currently unavailable.`);
+
+    const base = line.kind === "bottle" ? menuItem.bottle : menuItem.glass;
+    if (!Number.isFinite(base)) throw new Error(`"${menuItem.name}" has no valid ${line.kind} price.`);
+
+    let modifierTotal = 0;
+    const realOptions = menuItem.modifierGroup?.options || [];
+    for (const m of line.modifiers || []) {
+      const realOption = realOptions.find((o) => o.id === m.id);
+      if (!realOption) throw new Error(`Invalid option selected for "${menuItem.name}".`);
+      modifierTotal += Number(realOption.priceDelta) || 0;
+    }
+
+    const unit = +(base + modifierTotal).toFixed(2);
+    const lineTotal = +(unit * qty).toFixed(2);
+    subtotal = +(subtotal + lineTotal).toFixed(2);
+    verifiedItems.push({ name: menuItem.name, qty, kind: line.kind, unit, lineTotal });
+  }
+
+  return { subtotal, verifiedItems };
+}
+
+async function resolveTaxSettingsForOutlet(outletId) {
+  const [outletsDoc, taxDoc] = await Promise.all([
+    db.collection("kv").doc("wfa-outlets").get(),
+    db.collection("kv").doc("wfa-tax-settings-by-chain").get(),
+  ]);
+  const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+  const taxByChain = taxDoc.exists ? taxDoc.data().value || {} : {};
+  const chain = outletId ? outletsList.find((o) => o.id === outletId)?.chain : DEFAULT_CHAIN;
+  return taxByChain[chain] || taxByChain.__default || DEFAULT_TAX_SETTINGS;
+}
+
 app.post("/create-checkout-session", async (req, res) => {
   try {
-    const { amount, currency = "sgd", table, outlet, customer, items, subtotal, serviceCharge, gst, returnUrl, wantsMembership, marketingConsent } = req.body;
+    const { currency = "sgd", table, outlet, customer, items, returnUrl, wantsMembership, marketingConsent } = req.body;
 
-    if (!Number.isInteger(amount) || amount < 50) {
-      return res.status(400).json({ error: "Invalid amount (must be integer cents, min 50)." });
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Cart is empty." });
     }
     if (!returnUrl) {
       return res.status(400).json({ error: "returnUrl is required (the ordering app's own URL)." });
+    }
+    if (!db) {
+      return res.status(501).json({ error: "Firestore not configured — checkout requires real menu/pricing data." });
+    }
+
+    // Real price verification — subtotal, GST, and service charge are
+    // now derived entirely from the actual menu and actual tax settings
+    // in Firestore, never from whatever the request body claims. See
+    // the SERVER-SIDE PRICE VERIFICATION block above for why this
+    // matters: without it, a modified request could set any price at
+    // all for what Stripe actually charges.
+    let subtotal, serviceCharge, gst, totals, verifiedItems;
+    try {
+      const verified = await computeVerifiedSubtotal(outlet, items);
+      subtotal = verified.subtotal;
+      verifiedItems = verified.verifiedItems;
+      const taxSettings = await resolveTaxSettingsForOutlet(outlet);
+      totals = computeOrderTotals(subtotal, taxSettings);
+      serviceCharge = totals.serviceCharge;
+      gst = totals.gst;
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
+    }
+
+    const amount = Math.round(totals.total * 100); // Stripe wants integer cents
+    if (amount < 50) {
+      return res.status(400).json({ error: "Order total is below Stripe's minimum chargeable amount." });
     }
 
     // Membership + first-order discount — deliberately entirely
@@ -380,7 +570,7 @@ app.post("/create-checkout-session", async (req, res) => {
             currency,
             product_data: {
               name: `WFA Asia order${table ? ` — Table ${table}` : ""}${discountApplied ? " (10% member discount applied)" : ""}`,
-              description: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500) || undefined,
+              description: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500) || undefined,
             },
             unit_amount: finalAmount,
           },
@@ -393,7 +583,7 @@ app.post("/create-checkout-session", async (req, res) => {
         customerName: customer?.name || "",
         customerEmail: customer?.email || "",
         customerPhone: customer?.phone || "",
-        items: (items || []).map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+        items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
         memberDiscountApplied: discountApplied ? "1" : "0",
       },
       success_url: successUrl,
@@ -418,7 +608,7 @@ app.post("/create-checkout-session", async (req, res) => {
     if (db) {
       try {
         await db.collection("checkoutPending").doc(session.id).set({
-          items: items || [],
+          items: verifiedItems,
           table: table ? String(table) : null,
           outlet: outlet || null,
           subtotal: subtotal ?? null,
@@ -520,11 +710,10 @@ app.post("/order-paid", async (req, res) => {
 app.post("/pos/complete-order", requireAuth, async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
-    const { outlet, table, items, subtotal, serviceCharge, gst, total, customer, wantsMembership, marketingConsent } = req.body;
+    const { outlet, table, items, customer, wantsMembership, marketingConsent } = req.body;
 
     if (!outlet) return res.status(400).json({ error: "outlet is required." });
     if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: "At least one item is required." });
-    if (!Number.isFinite(total) || total <= 0) return res.status(400).json({ error: "Invalid total." });
 
     // Same scoping rule as viewing orders — a staff login can only
     // complete a POS sale for an outlet they're actually allowed to
@@ -533,6 +722,24 @@ app.post("/pos/complete-order", requireAuth, async (req, res) => {
     const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
     if (!userCanSeeOutlet(req.authUser, outlet, outletsList)) {
       return res.status(403).json({ error: "You don't have access to complete orders for this outlet." });
+    }
+
+    // Same real price verification as online checkout — staff-entered
+    // doesn't mean trusted-without-checking. Re-priced against the
+    // actual menu and actual tax settings, not whatever the POS screen
+    // happened to compute and send.
+    let subtotal, serviceCharge, gst, total, verifiedItems;
+    try {
+      const verified = await computeVerifiedSubtotal(outlet, items);
+      subtotal = verified.subtotal;
+      verifiedItems = verified.verifiedItems;
+      const taxSettings = await resolveTaxSettingsForOutlet(outlet);
+      const totals = computeOrderTotals(subtotal, taxSettings);
+      serviceCharge = totals.serviceCharge;
+      gst = totals.gst;
+      total = totals.total;
+    } catch (e) {
+      return res.status(400).json({ error: e.message });
     }
 
     // Membership discount — same server-side, transaction-guarded logic
@@ -581,7 +788,7 @@ app.post("/pos/complete-order", requireAuth, async (req, res) => {
       ts: new Date().toISOString(),
       orderNumber,
       queueNumber,
-      items,
+      items: verifiedItems,
       total: finalTotal,
       subtotal: subtotal ?? null,
       serviceCharge: serviceCharge ?? null,
@@ -1308,7 +1515,7 @@ function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
-app.post("/auth/login", async (req, res) => {
+app.post("/auth/login", authLimiter, async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured — user accounts require Firestore." });
   try {
     const email = normalizeEmail(req.body.email);
@@ -1344,7 +1551,7 @@ app.get("/auth/me", requireAuth, (req, res) => {
 // just the "empty users collection" check) so there's no window after
 // deploying where a stranger who happens to find this URL first could
 // register themselves as master before the real owner does.
-app.post("/auth/bootstrap-master", requireAdminKey, async (req, res) => {
+app.post("/auth/bootstrap-master", authLimiter, requireAdminKey, async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
     const existing = await db.collection("users").limit(1).get();
@@ -1536,23 +1743,33 @@ app.get("/orders", async (req, res) => {
 app.post("/orders", async (req, res) => {
   const { order } = req.body;
   if (!order || !order.id) return res.status(400).json({ error: "order required" });
+
+  // Price/items fields are deliberately stripped out here — this is
+  // the guest's OWN browser pushing its own copy of the order (a
+  // fallback for instant UI feedback, or in case the primary
+  // webhook/order-paid path somehow never fires at all). Those two
+  // paths are the ones that compute totals against the real, verified
+  // menu — if this endpoint could overwrite them too, a client landing
+  // AFTER the verified write could silently replace a correct total
+  // with whatever the browser itself believed, undoing the whole
+  // point of server-side price verification. Everything else (table,
+  // customer contact info) is low-stakes and fine to accept here.
+  const { total, subtotal, serviceCharge, gst, items, ...safeFields } = order;
+
   if (db) {
     try {
-      // merge:true matters here specifically — this is the guest's OWN
-      // browser pushing its own copy of the order (a fallback for
-      // instant UI feedback), which has no idea about orderNumber/
-      // queueNumber (those only exist once the webhook/order-paid path
-      // assigns them server-side). A plain .set() would silently erase
-      // whichever of those already got written, if this call happens
-      // to land second. merge:true means whichever fields each caller
-      // knows about get applied, without wiping what the other wrote.
-      await db.collection("orders").doc(order.id).set(order, { merge: true });
+      // merge:true matters here specifically — order/queue numbers
+      // (assigned only by the webhook/order-paid path) shouldn't be
+      // wiped just because this fallback call landed second.
+      await db.collection("orders").doc(order.id).set(safeFields, { merge: true });
       return res.json({ ok: true });
     } catch (e) {
       console.error("Firestore order write failed:", e.message);
       return res.status(500).json({ error: e.message });
     }
   }
+  // In-memory fallback (no Firestore) has no separate verified-price
+  // path to protect, so the full client-submitted order is fine here.
   memOrders = [order, ...memOrders];
   res.json({ ok: true, count: memOrders.length });
 });
