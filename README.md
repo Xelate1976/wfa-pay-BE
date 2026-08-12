@@ -1,12 +1,14 @@
 # WFA Asia — Payments Backend (wfa-pay-BE)
 
 Express/Node backend for the WFA Asia ordering system. Handles menu,
-outlets, tables, and banner data via Firestore, media uploads via
-Cloud Storage, payments via Stripe Checkout + webhooks, and order
-notifications via WhatsApp, Telegram, and email. Serves the
-`FD-payment` frontend.
+outlets, tables, banners, orders, membership, and real user accounts
+via Firestore, media uploads via Cloud Storage, payments via Stripe
+Checkout + webhooks, and order notifications via WhatsApp, Telegram,
+and email. Serves every WFA Asia frontend — `FD-payment`,
+`wfa-live-orders`, `wfa-order-ready`, and eventually `wfa-pos`.
 
-- **Frontend repo**: `Xelate1976/FD-payment`
+- **Frontend repos**: `Xelate1976/FD-payment`, `wfa-live-orders`,
+  `wfa-order-ready`
 - **Live (Cloud Run)**: https://wfa-pay-be-191248130012.asia-southeast1.run.app
 - **Live (Render, legacy/backup)**: https://wfa-pay-be.onrender.com
 
@@ -14,21 +16,31 @@ notifications via WhatsApp, Telegram, and email. Serves the
 
 ## What's in here
 
-- **Stripe Checkout** — creates checkout sessions for cart orders,
-  redirects same-tab
-- **Stripe webhook** (`POST /webhook`) — listens for
-  `checkout.session.completed`, records the paid order and fires
-  notifications
+- **Real auth** — hashed passwords, signed tokens, three roles
+  (outlet/group/master), server-enforced data scoping
+- **Server-verified pricing** — every checkout amount (online and POS)
+  is computed from the real menu and real tax settings in Firestore,
+  never trusted from the request itself
+- **Stripe Checkout + webhook** — creates sessions, records paid
+  orders reliably (survives a guest's browser never completing the
+  return trip), fires notifications
+- **Order/queue numbering** — permanent per-outlet order numbers,
+  toggleable queue numbers, transaction-safe against duplicates
+- **Order ready status** — server-tracked (not per-device): ready →
+  on the public board → collected (removed) → re-broadcastable if
+  cleared by mistake
+- **Membership** — first-order discount + separate marketing consent,
+  transaction-guarded against double use
+- **POS** — staff-entered cash orders, same numbering/notification/
+  pricing pipeline as online orders, no Stripe involved
+- **Rate limiting** — strict on login/bootstrap, looser everywhere else
 - **Firestore** — persistent storage for outlets, menu, tables,
-  banners, orders, and notifications (all under a `kv` collection)
-- **Cloud Storage** — real file storage for uploaded menu photos and
-  banner media (images/GIFs/MP4), so Firestore's 1MiB document limit
-  isn't a bottleneck
-- **Order notifications** — WhatsApp (via Green-API), Telegram, and
-  email (via Resend), each independently optional and configurable
-  **per outlet** — see below
-- **CORS** — locked to a single allowed origin (the deployed frontend)
-  via `ALLOWED_ORIGIN`
+  banners, orders, members, users, and counters
+- **Cloud Storage** — real file storage for uploaded media
+- **Notifications** — WhatsApp (Green-API), Telegram, and email
+  (Resend), each independently optional, configurable **per outlet**
+- **CORS** — supports multiple allowed origins at once (comma-separated
+  `ALLOWED_ORIGIN`), since several frontends now share this backend
 
 ---
 
@@ -38,285 +50,362 @@ notifications via WhatsApp, Telegram, and email. Serves the
 |---|---|
 | `STRIPE_SECRET_KEY` | Stripe secret key (`sk_test_...` or `sk_live_...`) |
 | `STRIPE_WEBHOOK_SECRET` | Signing secret for the registered webhook endpoint (`whsec_...`) |
-| `ALLOWED_ORIGIN` | Frontend's deployed origin, e.g. `https://fd-payment.vercel.app` — **no trailing slash** |
-| `GCS_BUCKET_NAME` | Cloud Storage bucket name for media uploads, e.g. `wfa-project-504813-media` |
+| `ALLOWED_ORIGIN` | **Comma-separated** list of every frontend's deployed origin — no trailing slashes, no spaces around commas |
+| `AUTH_TOKEN_SECRET` | Long random string signing login tokens. If unset, a temporary one is generated per process — every login gets invalidated on the next restart/redeploy, fine for testing, not for real use |
+| `ADMIN_API_KEY` | Shared secret protecting `/outlet-secrets/*` and `/auth/bootstrap-master` |
+| `GCS_BUCKET_NAME` | Cloud Storage bucket name for media uploads |
 | `FIRESTORE_DATABASE_ID` | Firestore database ID — see gotcha below, this is **not** `(default)` |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | (Render only) explicit service account credentials JSON. Not needed on Cloud Run — see Credentials section below |
-| `ADMIN_API_KEY` | Shared secret protecting the `/outlet-secrets/*` endpoints — see Notifications section below |
-| `GREENAPI_INSTANCE_ID` / `GREENAPI_API_TOKEN` | Shared fallback WhatsApp (Green-API) credentials, used by any outlet that hasn't set its own |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | (Render only) explicit service account credentials JSON |
+| `GREENAPI_INSTANCE_ID` / `GREENAPI_API_TOKEN` | Shared fallback WhatsApp credentials |
 | `MERCHANT_WHATSAPP_NUMBER` / `SUPPLIER_WHATSAPP_NUMBER` | Shared fallback WhatsApp recipient numbers (digits only, no `+`) |
-| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Shared fallback Telegram credentials, used the same way as the Green-API fallback above |
-| `RESEND_API_KEY` / `RECEIPT_FROM_EMAIL` | Email receipts to customers via Resend |
+| `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | Shared fallback Telegram credentials |
+| `RESEND_API_KEY` / `RECEIPT_FROM_EMAIL` | Email receipts to customers |
 
-A `.env.example` in this repo lists these for local development.
+**Dependencies** (`package.json` — must include all of these or the
+deploy fails with `ERR_MODULE_NOT_FOUND`):
+`express`, `cors`, `stripe`, `dotenv`, `firebase-admin`,
+`@google-cloud/storage`, `express-rate-limit`. (`crypto` is Node's
+own built-in, no install needed.)
 
 ---
 
-## Credentials — how auth works
+## Security — server-side price verification
 
-This backend tries two credential paths, falling through gracefully:
+Every checkout amount is now **re-derived from real data**, never
+trusted from what the request claims:
 
-1. **Explicit key** (`GOOGLE_SERVICE_ACCOUNT_JSON` env var set) — parses
-   the JSON and authenticates with it directly. This is the path used
-   on **Render**, since Render has no built-in Google Cloud identity.
-2. **Application Default Credentials (ADC)** — if no explicit key is
-   set, tries ADC instead. On **Cloud Run**, this just works
-   automatically using the service's attached service account — no
-   key file needed. Anywhere else without `gcloud auth` configured
-   (a bare laptop, etc.), this throws, and the app falls through to
-   an in-memory fallback rather than crashing entirely.
+1. `create-checkout-session` and `pos/complete-order` both take the
+   cart's `items` (id, qty, kind, selected modifiers) and look each one
+   up against the **real, current menu** in Firestore — chain catalog +
+   that outlet's own price overrides + availability
+2. Any item that doesn't exist, is inactive, or references a modifier
+   that doesn't actually belong to it is **rejected outright** — not
+   silently patched over
+3. GST and service charge are computed from the outlet's **real** tax
+   settings, using the exact same math as the frontend
+   (`computeOrderTotals()`, kept deliberately identical on both sides)
+4. The client-sent `amount`/`subtotal`/`serviceCharge`/`gst`/`total`
+   fields are **never used for what actually gets charged** — only the
+   server-computed numbers are
 
-Startup logs which path was used:
-```
-Firestore connected via ADC (database: "wfa-data") — data will persist across restarts.
-```
-or
-```
-Firestore connected via explicit key (database: "wfa-data") — data will persist across restarts.
+**A related gap closed at the same time**: the guest's own browser
+fallback push (`POST /orders`, used for instant UI feedback / as a
+backup if the primary recording path fails) used to accept a full
+client-constructed order object with `merge: true`. If that call
+landed *after* the real, verified order was already recorded, it could
+silently overwrite the verified total with whatever the browser
+believed. Fixed by stripping `total`/`subtotal`/`serviceCharge`/`gst`/
+`items` from what that endpoint can ever write — those fields are only
+ever set by the verified path now.
+
+**Payment methods**: `create-checkout-session` no longer hardcodes
+`payment_method_types: ["card"]`. That line was silently overriding
+whatever's enabled in Stripe Dashboard → Settings → Payment methods
+(PayNow, GrabPay, Apple Pay, etc.) — removing it lets Stripe show
+whatever's actually turned on there (dynamic payment methods).
+
+---
+
+## Rate limiting
+
+Two tiers, via `express-rate-limit`:
+- **Strict** (`authLimiter`) on `/auth/login` and
+  `/auth/bootstrap-master` — 10 attempts per IP per 15 minutes. Real
+  people mistyping a password are unaffected; brute-force scripts are
+  effectively blocked.
+- **General** (`generalLimiter`, applied globally) — 120 requests per
+  IP per minute. Generous enough for real usage (Live Orders polling
+  every 5s, customers browsing); mainly guards against scripted abuse
+  driving up Cloud Run's per-request billing.
+
+Requires `app.set("trust proxy", 1)` — Cloud Run sits behind Google's
+load balancer, so without this, every request would appear to come
+from the same proxy IP instead of the real client.
+
+---
+
+## Auth
+
+Three roles, each carrying a **scope**:
+
+| Role | `scope` is | Sees |
+|---|---|---|
+| `outlet` | one outlet id | Only that outlet |
+| `group` | one chain name | Every outlet under that chain |
+| `master` | `null` | Everything |
+
+**Passwords**: hashed with Node's built-in `scrypt` (no extra
+dependency, memory-hard). **Tokens**: a minimal hand-rolled
+HMAC-SHA256 signed payload — same idea as a JWT, intentionally smaller
+and fully auditable in this one file rather than a black-box library.
+7-day expiry.
+
+**A known, deliberate tradeoff**: tokens are returned in the JSON
+response body and stored in `localStorage` on the frontend, not in an
+`httpOnly` cookie. Cookie-based storage would be more resistant to XSS
+token theft, but requires the backend to set `Set-Cookie`, CORS
+`credentials: true`, and CSRF protection — a real change, more
+involved given multiple separate frontend origins (ordering site, Live
+Orders, Order Ready, POS) would all need the cookie shared correctly.
+Worth revisiting, not yet done.
+
+**Endpoints:**
+- `POST /auth/login` — rate-limited, returns a token
+- `GET /auth/me` — verify a token, get back role/scope/name
+- `POST /auth/bootstrap-master` — creates the **first** master account
+  only (refuses once any user exists), gated behind `x-admin-key` *and*
+  rate-limited
+- `POST /auth/users`, `GET /auth/users`, `DELETE /auth/users/:email` —
+  master manages all other accounts
+
+**Creating the first account** (one-time, no UI for this deliberately):
+```bash
+curl -X POST https://wfa-pay-be-191248130012.asia-southeast1.run.app/auth/bootstrap-master \
+  -H "Content-Type: application/json" \
+  -H "x-admin-key: YOUR_ADMIN_KEY" \
+  -d '{"email":"you@example.com","password":"yourpassword123","name":"Your Name"}'
 ```
 
-If Firestore doesn't connect at all (bad credentials, wrong project,
-etc.), the app falls back to a fully **in-memory** store — fine for
-quick testing, but everything resets on restart/redeploy.
+**What's actually protected:** `GET /orders` and `GET /notifications`
+use *soft* auth — no token returns an empty array rather than a 401,
+since the customer-facing ordering site calls these too on every load
+(for demo-seed checking) and shouldn't error out. `POST /store/:key`
+(writes to menu/outlets/tables/banners) uses *hard* `requireAuth` — a
+401 if not logged in. This closed a real pre-existing hole: before
+this, **anyone on the internet** could overwrite the entire menu with
+zero authentication.
+
+---
+
+## Order numbers & queue numbers
+
+`assignOrderAndQueueNumbers(outletId)` — Firestore-transaction-safe,
+same reasoning as the notification dedup below: a plain
+read-increment-write has a race window where two near-simultaneous
+orders could both grab the same number.
+
+- **Order number**: per-outlet, continuously incrementing, never resets
+- **Queue number**: only assigned while that outlet's
+  `queueModeEnabled` flag is on; `POST /counters/:outletId/reset-queue`
+  resets it to 0 (so the next order becomes #1) — called by the
+  frontend every time queue mode gets switched on
+
+Both numbers are idempotent against the webhook and `/order-paid`
+racing each other for the same order — whichever call recorded it
+first "wins," the second reuses the existing numbers rather than
+burning fresh ones.
+
+---
+
+## Order ready status
+
+Real, server-tracked — not a per-device thing. Three states an order
+moves through: **active** (not yet ready) → **on the board** (ready,
+not collected) → **collected** (removed from the board). This is what
+makes every screen (dashboard Live Orders tab, the standalone kiosk
+site, *and* the public customer-facing board) agree on what's actually
+happening.
+
+- `POST /orders/:id/mark-ready` — marks one order ready, outlet-scoped
+- `POST /orders/mark-all-ready` — bulk version, powers "Clear all"
+- `POST /orders/:id/mark-collected` — takes it OFF the public board —
+  distinct from "ready": ready means kitchen's done, collected means
+  the customer actually has it in hand
+- `POST /orders/:id/rebroadcast` — puts it back on the board (fixes an
+  accidental "Collected" tap, or a customer saying they were never
+  called), refreshes `readyAt` so it shows as freshly-arrived again
+- `GET /orders/ready-board?outlet=X` — **deliberately public, no
+  login**. Unlike every other order endpoint, this must never return
+  customer name/email/phone/items — only order number, queue number,
+  and when it became ready. Collected orders are filtered out; a
+  30-minute window is a safety net for anything that never gets
+  manually marked collected at all.
+
+⚠️ `mark-all-ready` and `ready-board` use Firestore compound queries
+that need a one-time composite index. The first time each runs,
+Firestore's error response includes a direct link to create it — check
+Cloud Run's logs if either looks stuck rather than actually broken.
+
+---
+
+## Membership
+
+`members` collection, keyed by email — global across every outlet and
+brand (not scoped per outlet or chain).
+
+- First-order discount (10%) checked and applied **server-side**,
+  inside a Firestore transaction, baked directly into whatever amount
+  gets charged (Stripe checkout or POS cash total) — never just a
+  frontend display trick
+- Marketing consent is a **separate** field from the discount itself —
+  someone can remain a member while opting out of promos
+- `POST /members/unsubscribe` — withdraws marketing consent only,
+  no login required (matches how any unsubscribe link needs to work),
+  doesn't leak whether an email is registered
+- `MEMBERSHIP_CONSENT_VERSION` is stamped on every member record, so
+  it's always clear which version of the consent wording someone
+  actually agreed to
+
+---
+
+## POS — cash orders
+
+`POST /pos/complete-order` — requires login, outlet-scoped (an outlet
+login can only complete sales for their own outlet; group/master for
+outlets within their scope). Prices are server-verified exactly like
+online checkout (see Security section above) — no Stripe involved at
+all, but reuses:
+
+- The same real-menu price lookup and verification
+- The same order/queue numbering as online orders
+- The same membership discount transaction logic
+- The same `notifyOnPayment()` — WhatsApp/Telegram/email all fire
+  identically regardless of payment channel
+
+Orders get `paymentMethod: "cash"` and `staffUser: <who processed it>`
+for real accountability, distinguishing them from Stripe-paid orders
+in Reports.
 
 ---
 
 ## Order notifications — WhatsApp, Telegram, email
 
-Each order-paid event fires up to three channels, all independently
-optional:
-
-### Per-outlet vs. shared fallback
-Every outlet can have its **own** WhatsApp/Telegram credentials —
-useful since each physical location often has its own staff phone or
-group chat. Set from the dashboard (**Merchant → Outlets → WhatsApp**
-button on each outlet row). If an outlet hasn't configured its own,
-notifications fall back to the shared `GREENAPI_*`/`TELEGRAM_*` env
-vars above. This resolution happens automatically in
-`notifyOnPayment()` — no code changes needed to onboard a new outlet's
-own number.
-
-### Why outlet credentials live in a separate Firestore collection
-Per-outlet WhatsApp tokens and Telegram bot tokens are stored in a
-dedicated `outletSecrets` collection — **not** mixed into the public
-`kv/wfa-outlets` document that the customer ordering page fetches
-openly. Mixing secrets into a document a guest's browser can read
-would leak them straight into browser dev tools.
-
-### `requireAdminKey` — protecting the outlet-secrets endpoints
-All `/outlet-secrets/*` routes require an `x-admin-key` header
-matching the `ADMIN_API_KEY` env var. If `ADMIN_API_KEY` isn't set,
-the check is skipped (convenient for local dev — set it before going
-live). The dashboard prompts for this key at runtime rather than
-hardcoding it in the frontend bundle — see the frontend README for why
-that distinction matters.
-
-**Endpoints:**
-| Route | Purpose |
-|---|---|
-| `GET /outlet-secrets/:outletId` | Fetch an outlet's saved WhatsApp/Telegram config |
-| `POST /outlet-secrets/:outletId` | Save/update an outlet's config (merges, doesn't overwrite unset fields) |
-| `GET /outlet-secrets/:outletId/qr` | Proxies Green-API's QR endpoint — lets the dashboard show a live "scan to link" QR code without opening Green-API's own console |
-| `GET /outlet-secrets/:outletId/wa-status` | Polls whether that outlet's WhatsApp instance is authorized yet, so the dashboard can auto-detect a successful scan |
-| `GET /outlet-secrets/:outletId/telegram-chat-id` | Looks up a Telegram chat's numeric ID automatically via `getUpdates`, after the merchant has messaged the bot once — saves hunting through Telegram's raw API by hand |
-
-### WhatsApp via Green-API
-Wraps a WhatsApp Web session in a REST API — no Meta Business
-verification or template approval needed, so it's fast to set up.
-Trade-off: it's not the official WhatsApp Business Platform, so it's
-best suited to low-volume internal alerts (a merchant/supplier
-number), not bulk customer-facing messaging. The WhatsApp *number*
-itself needs to be linked once via QR code (console.green-api.com, or
-directly from the dashboard's "Show QR to link" button) before
-messages will actually deliver — an unlinked instance queues messages
-without sending them, which looks like a silent failure if you don't
-know to check.
-
-**Common failure modes:**
-- **QR code expired before scanning** — Green-API QR codes expire in
-  ~15–20s. The dashboard's QR display auto-refreshes every 15s to
-  cover this; if linking through Green-API's own console instead,
-  regenerate the code right before scanning.
-- **"Can't link new devices right now"** on WhatsApp's side — usually
-  an expired/stale QR (see above), occasionally WhatsApp's own
-  4-linked-device cap, rarely a temporary rate limit after several
-  attempts in a short window.
+### WhatsApp (Green-API)
+Per-outlet instance/token, configured from the dashboard's Outlets
+panel — includes live QR-code linking (auto-refreshes every 15s) and
+status polling, no need to leave the dashboard.
 
 ### Telegram
-Simpler and more reliable than WhatsApp for this use case — no device
-linking, no expiring codes, just a bot token + chat ID.
-1. Message **@BotFather** on Telegram, `/newbot`, follow the prompts →
-   get a token like `123456789:ABC-defGhIJKlmNoPQ`
-2. Save that token for the outlet (or as the shared `TELEGRAM_BOT_TOKEN`
+Simpler and more reliable — no device linking, just a bot token + chat
+ID.
+1. Message **@BotFather**, `/newbot`, get a token
+2. Save it for the outlet (or as the shared `TELEGRAM_BOT_TOKEN`
    fallback)
-3. Message the bot once from the chat you want alerts in
-4. Use the dashboard's "Find my Chat ID" button (or call
-   `GET /outlet-secrets/:outletId/telegram-chat-id` directly) to
-   auto-fill the chat ID
+3. Message the bot once from the target chat
+4. Use "Find my Chat ID" (calls `GET /outlet-secrets/:outletId/telegram-chat-id`)
 
-#### If "Find my Chat ID" comes back empty
-This has happened even with a freshly created bot, a confirmed-correct
-saved token (verified directly against Firestore), and messages that
-show as delivered (double checkmarks) in the Telegram client — with
-`getUpdates` still reporting `"result":[]`, checked both from a
-browser and from the backend itself. Root cause unconfirmed; possibly
-a propagation delay on very new bots. Rather than chase it further in
-the moment, there's a reliable manual workaround:
-1. In Telegram, message **@userinfobot** (a long-running, independent
-   community utility bot — not affiliated with this project)
-2. It replies instantly with your numeric Telegram user ID
-3. For a private 1-on-1 chat with any bot, that number **is** the chat
-   ID — paste it directly into the **Telegram Chat ID** field and Save,
-   skipping "Find my Chat ID" entirely
-
-Things worth ruling out first if this comes up again:
-- **Wrong token** — confirm via `GET https://api.telegram.org/bot<TOKEN>/getMe`
-  that the `username` matches the bot you're actually messaging
-- **A webhook already registered on that bot** — check
-  `GET https://api.telegram.org/bot<TOKEN>/getWebhookInfo`; a non-empty
-  `url` means Telegram is routing updates there instead of to
-  `getUpdates`, and `deleteWebhook` needs to be called first
-- **Group chat with bot privacy mode on** — bots can't see regular
-  group messages by default; turn off Group Privacy for that bot via
-  BotFather → `/mybots` → Bot Settings, or just message it directly
-  instead of in a group
+If that button comes back empty despite a confirmed-correct token: the
+reliable manual workaround is messaging **@userinfobot** (an
+independent utility bot) — its reply is your numeric ID, and for a
+private 1-on-1 chat with any bot, that number **is** the chat ID.
+Things worth checking first: wrong token (verify via `getMe`), a
+webhook already registered on that bot (`getWebhookInfo` — a non-empty
+`url` means Telegram routes updates there instead), or group privacy
+mode blocking the bot from seeing messages.
 
 ### Email via Resend
-Sends a receipt to the *customer's* email on successful payment (not
-a merchant alert channel like the two above). Requires `RESEND_API_KEY`
-and, optionally, `RECEIPT_FROM_EMAIL` (defaults to a placeholder
-address — set this to a real verified sending domain before going
-live).
+Customer receipts only, not a merchant alert channel. Needs
+`RESEND_API_KEY` and a real verified `RECEIPT_FROM_EMAIL` before going
+live.
 
 ### Why notifications used to arrive twice
-`notifyOnPayment()` is called from **two** places — the Stripe webhook
-(`POST /webhook`, the reliable source of truth) and `/order-paid` (a
-convenience call the frontend makes for instant UI feedback once it
-notices payment succeeded via polling). Both routinely fire for the
-same order within moments of each other, so without a guard, every
-WhatsApp/Telegram/email notification went out **twice** per order.
-
-Fixed via `markNotifiedOnce(sessionId)` — checks/sets a `notified`
-flag on that session's `checkoutPending` Firestore document inside a
-**transaction**, not a plain read-then-write. The transaction matters
-specifically because a plain check has a race window where both
-near-simultaneous calls could see "not yet notified" before either one
-writes the flag — a transaction makes only one of them actually win.
-Without Firestore configured (in-memory fallback mode), a simple
-in-memory `Set` does the same job for a single server instance, though
-it won't dedupe across multiple Cloud Run instances in that fallback
-mode — one more reason Firestore should be considered required for any
-real deployment, not just nice-to-have.
+`notifyOnPayment()` is called from both the Stripe webhook and
+`/order-paid` (a frontend convenience call for instant UI feedback).
+Fixed via `markNotifiedOnce(sessionId)` — a Firestore **transaction**
+sets a `notified` flag, so only whichever call arrives first actually
+sends anything.
 
 ---
 
-## Deployment
+## Credentials — how Firestore/Storage auth works
 
-### Cloud Run (asia-southeast1) — primary
-- Service: `wfa-pay-be`
-- Region: `asia-southeast1`
-- URL: https://wfa-pay-be-191248130012.asia-southeast1.run.app
-- Continuously deployed from GitHub `main` via **Developer Connect +
-  Google Cloud buildpacks** (no Dockerfile needed — buildpacks
-  auto-detect Node.js from `package.json`)
-- Entrypoint: `node server.js` (set explicitly, since there's no
-  `"start"` script assumption to rely on)
-- Env vars set in **Cloud Run → Edit & deploy new revision → Variables
-  & Secrets** (see table above)
-- Auth: Application Default Credentials (no `GOOGLE_SERVICE_ACCOUNT_JSON`
-  needed here — the Cloud Run service account handles it)
+Two paths, falling through gracefully:
 
-**One-time IAM setup required**: the Cloud Build service account
+1. **Explicit key** (`GOOGLE_SERVICE_ACCOUNT_JSON` set) — used on
+   **Render**, which has no built-in Google Cloud identity
+2. **Application Default Credentials (ADC)** — used on **Cloud Run**
+   automatically via the attached service account, no key file needed
+
+Startup logs which path was used. If Firestore doesn't connect at all,
+the app falls back to a fully **in-memory** store — fine for quick
+testing, but everything resets on restart/redeploy, role-based data
+scoping degrades to master-only, and **price verification for
+checkout is unavailable entirely** (it requires real menu data, so
+checkout is blocked with a clear error rather than falling back to
+trusting the client).
+
+---
+
+## Deploying
+
+### Cloud Run — primary
+Continuous deploy from GitHub `main` via Developer Connect +
+buildpacks. The Cloud Build service account
 (`[PROJECT_NUMBER]-compute@developer.gserviceaccount.com`) needs the
-**"Developer Connect Read Token Accessor (Beta)"** role granted in
-IAM & Admin → IAM. Without it, every GitHub-triggered build fails at
-the `FETCHSOURCE` step with:
-```
-ERROR: error fetching DeveloperConnect credentials: googleapi: Error 403:
-Permission 'developerconnect.gitRepositoryLinks.fetchReadToken' denied
-```
+**"Developer Connect Read Token Accessor (Beta)"** role in IAM & Admin
+→ IAM, or every build fails at `FETCHSOURCE` with a 403.
 
-**Deploying real changes vs. "Redeploy"**: Cloud Run/Vercel's
-"Redeploy" option rebuilds the *exact same* previously-built snapshot
-— it does **not** pull new commits from GitHub, no matter how many
-times you click it. Always push a real, new commit to trigger a fresh
-build; check the build log for a new bundle/image hash to confirm it
-actually picked up your latest change.
+**"Redeploy" doesn't pull new code** — it rebuilds the exact same
+snapshot. Always push a real commit; check the build log for a new
+image hash to confirm it picked up the change.
 
 ### Render — legacy/backup
-- URL: https://wfa-pay-be.onrender.com
-- Uses `GOOGLE_SERVICE_ACCOUNT_JSON` for Firestore/Cloud Storage auth
-  (Render has no native Google Cloud identity, unlike Cloud Run)
-- Free tier spins down after ~15 min idle — first request after that
-  has a cold-start delay
+- https://wfa-pay-be.onrender.com
+- Uses `GOOGLE_SERVICE_ACCOUNT_JSON` for auth
+- Free tier spins down after ~15 min idle — cold-start delay on the
+  first request after that
+- **Same `package.json` feeds both platforms** — a missing dependency
+  breaks both Render and Cloud Run identically, not just one
 
 ---
 
 ## Known gotchas
 
 ### Firestore database name — the #1 silent failure
-Firestore projects can have multiple databases. This project has two:
-- `(default)` — **empty**, created automatically by Google Cloud, not
-  used
-- `wfa-data` — the **real** database, holds everything (outlets, menu,
-  banners, tables, orders, outletSecrets) under the `kv` and
-  `outletSecrets` collections
+`(default)` is empty; the real database is `wfa-data`. If
+`FIRESTORE_DATABASE_ID` is unset or `(default)`, every read/write
+silently fails with `{"error":"5 NOT_FOUND: "}` — no stack trace, just
+empty responses. Always confirm `FIRESTORE_DATABASE_ID=wfa-data` in
+whatever environment you're deploying to, and check the startup log
+line says `database: "wfa-data"`.
 
-If `FIRESTORE_DATABASE_ID` is unset or set to `(default)`, every
-read/write silently fails with:
-```json
-{"error":"5 NOT_FOUND: "}
-```
-No stack trace, no obvious error — just empty responses. This has cost
-real debugging time before. **Always confirm
-`FIRESTORE_DATABASE_ID=wfa-data`** in whatever environment you're
-deploying to (Render env, Cloud Run env vars, local `.env`, etc.).
-Verify by checking the startup log line — it should say
-`database: "wfa-data"`, not `database: "(default)"`.
+**Quick check**: console.cloud.google.com → Firestore → Firestore
+Studio → breadcrumb should read `Database: wfa-data`, with real
+documents in the `kv`, `users`, `members`, `orders`, and `counters`
+collections.
 
-#### How to check which Firestore database you're actually looking at
-1. Go to **console.cloud.google.com** → search "Firestore" in the top
-   search bar
-2. Click **Firestore Studio** in the left sidebar
-3. Look at the top breadcrumb: `All databases > Database: wfa-data` —
-   that's the database you're currently browsing
-4. Click **"All databases"** to see every database in the project and
-   check whether `(default)` is empty
-5. Confirm your target database has a `kv` collection with real
-   documents (`wfa-outlets`, `wfa-menu`, `wfa-banners`, `wfa-tables`)
+### Firestore security rules — not yet locked down, worth checking
+Since the frontend never talks to Firestore directly (only through
+this backend, via the Admin SDK, which bypasses rules entirely), this
+matters less than usual — but if the database was ever created in
+Firestore's default "test mode," anyone with the Firebase project ID
+could read/write directly via the client SDK, completely bypassing
+this backend's auth and price verification. Check Firestore → Rules in
+the console; if it's still the test-mode default, lock it down with a
+deny-all rule (safe, since nothing legitimate uses the client SDK
+anyway):
+```
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
+```
 
-**Quick sanity check via query** — run in Firestore Studio:
-```
-db.pipeline().collection('/kv').limit(100)
-```
-Real rows back = correct database. Nothing back = you're probably in
-`(default)`.
+### Firestore composite indexes
+A few newer endpoints (`mark-all-ready`, `ready-board`, queue reset)
+use compound `where()` queries that need a one-time index. First run
+throws an error with a direct creation link — check Cloud Run's logs.
+
+### CORS mismatches are silent
+A missing origin in `ALLOWED_ORIGIN` doesn't throw an obvious
+server-side error — requests just get blocked by the browser. Always
+double-check for exact matches (no trailing slash) across every
+frontend if API calls stop working after adding a new site.
 
 ### Cloud Storage IAM
-The service account running this backend needs the **Storage Object
-Admin** role explicitly granted, or media uploads fail silently with
-no clear error message.
+The service account needs **Storage Object Admin** explicitly granted,
+or uploads fail silently.
 
-### Cloud Build / Developer Connect permissions
-See the Cloud Run deployment section above — the **Developer Connect
-Read Token Accessor (Beta)** IAM role is required on the Cloud Build
-service account for GitHub-triggered builds to succeed.
-
-### Order writes — race conditions
-Order saving uses **append-only** endpoints, not whole-array
-overwrites, to avoid concurrent write collisions when multiple orders
-come in around the same time.
-
-### `server.js` exists in both repos
-Both `FD-payment` and `wfa-pay-BE` have a file named `server.js` (or
-similarly-named entry files) — always double-check which repo you're
-editing in before making changes. Backend logic changes belong here,
-in `wfa-pay-BE`, not in the frontend repo.
+### `server.js` exists in every frontend repo too
+Always double-check which repo you're editing in — backend logic
+belongs here, in `wfa-pay-BE`, not in any frontend.
 
 ### Verifying a deployment actually works
-Don't trust the Render dashboard or Firestore Studio console alone —
-both have been slow/unreliable for confirming state. Instead, hit a
-real API endpoint directly and check for actual JSON data, e.g.:
+Don't trust the dashboard/console alone — hit a real endpoint directly:
 ```
 https://wfa-pay-be-191248130012.asia-southeast1.run.app/store/wfa-outlets
 ```
@@ -325,24 +414,19 @@ https://wfa-pay-be-191248130012.asia-southeast1.run.app/store/wfa-outlets
 
 ## Stripe webhook setup
 
-The webhook handler lives at `POST /webhook` and listens for
-`checkout.session.completed`. It uses `express.raw()` (not
-`express.json()`) for this route specifically, since Stripe's
-signature verification requires the raw, unparsed request body.
+`POST /webhook`, listens for `checkout.session.completed`. Uses
+`express.raw()` (not `express.json()`) for this route specifically,
+since signature verification needs the raw body.
 
-To register the webhook in Stripe:
-1. Stripe Dashboard → **Developers → Webhooks → Add destination**
-2. Endpoint URL: `<your backend URL>/webhook` — e.g.
-   `https://wfa-pay-be-191248130012.asia-southeast1.run.app/webhook`
-3. Select the `checkout.session.completed` event (and optionally
-   `checkout.session.expired`)
-4. After creating it, reveal and copy the **signing secret**
-   (`whsec_...`) — this goes into `STRIPE_WEBHOOK_SECRET`
+1. Stripe Dashboard → Developers → Webhooks → Add destination
+2. Endpoint URL: `<backend URL>/webhook`
+3. Select `checkout.session.completed`
+4. Copy the signing secret (`whsec_...`) into `STRIPE_WEBHOOK_SECRET`
 
-**Test mode and live mode webhooks are entirely separate.** Setting
-one up doesn't carry over to the other — if you switch from test to
-live Stripe keys, you need to register a new live-mode webhook
-endpoint too.
+**Test and live mode webhooks are entirely separate** — switching keys
+requires registering a new webhook too. Same applies when switching
+to a different Stripe account entirely — the webhook doesn't carry
+over, it needs re-registering on the new account.
 
 ---
 
@@ -353,6 +437,6 @@ npm install
 npm run dev
 ```
 
-Copy `.env.example` to `.env` and fill in your own values — for local
-testing without Firestore, just leave `GOOGLE_SERVICE_ACCOUNT_JSON`
-unset and the app will use the in-memory fallback automatically.
+Copy `.env.example` to `.env`. Without `GOOGLE_SERVICE_ACCOUNT_JSON`
+set, the app uses the in-memory fallback automatically (with the
+checkout-blocking caveat noted in the Credentials section above).
