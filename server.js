@@ -679,14 +679,70 @@ app.post("/orders/mark-all-ready", requireAuth, async (req, res) => {
   }
 });
 
+// Marks an order collected — this is what actually takes it OFF the
+// public Order Ready board. Distinct from "ready": ready = "kitchen
+// says it's done", collected = "the customer actually has it in hand".
+// A TV board needs this because the 30-minute auto-expiry alone isn't
+// good enough — staff need to clear a number the moment it's picked
+// up, not wait half an hour.
+app.post("/orders/:id/mark-collected", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const ref = db.collection("orders").doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, order.outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to this order." });
+    }
+
+    await ref.set({ collected: true, collectedAt: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("mark-collected failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Puts an order back on the board — for the "tapped Collected by
+// mistake" case, or a customer saying they never actually got called.
+// Refreshes readyAt to right now, both so it reappears within the
+// board's 30-minute window and so it shows as freshly-arrived again
+// (the glow animation) rather than looking stale.
+app.post("/orders/:id/rebroadcast", requireAuth, async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const ref = db.collection("orders").doc(req.params.id);
+    const doc = await ref.get();
+    if (!doc.exists) return res.status(404).json({ error: "Order not found." });
+    const order = doc.data();
+
+    const outletsDoc = await db.collection("kv").doc("wfa-outlets").get();
+    const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
+    if (!userCanSeeOutlet(req.authUser, order.outlet, outletsList)) {
+      return res.status(403).json({ error: "You don't have access to this order." });
+    }
+
+    await ref.set({ collected: false, readyAt: new Date().toISOString() }, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("rebroadcast failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // Deliberately PUBLIC — no login required. This is what the customer-
 // facing Order Ready board reads, so unlike every other order-related
 // endpoint it must NEVER return customer name, email, phone, or items —
 // only what's safe for anyone walking past a screen to see: the order
-// number, queue number, and when it became ready. Only recently-ready
-// orders are returned (last 30 minutes) so the board doesn't accumulate
-// stale entries forever — this is the only real "expiry" mechanism, so
-// it deliberately isn't configurable per outlet right now.
+// number, queue number, and when it became ready. Only recently-ready,
+// not-yet-collected orders are returned — collected orders are filtered
+// out here (in JS, not the Firestore query itself, to avoid needing yet
+// another composite index), and the 30-minute window is a safety net
+// for anything that never gets manually marked collected at all.
 app.get("/orders/ready-board", async (req, res) => {
   if (!db) return res.json({ ready: [] });
   try {
@@ -702,6 +758,7 @@ app.get("/orders/ready-board", async (req, res) => {
 
     const ready = snap.docs
       .map((d) => d.data())
+      .filter((o) => !o.collected)
       .map((o) => ({ orderNumber: o.orderNumber ?? null, queueNumber: o.queueNumber ?? null, readyAt: o.readyAt }))
       .sort((a, b) => new Date(b.readyAt) - new Date(a.readyAt));
     res.json({ ready });
