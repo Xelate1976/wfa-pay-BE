@@ -367,7 +367,12 @@ app.post("/create-checkout-session", async (req, res) => {
 
     const session = await stripe.checkout.sessions.create({
       mode: "payment",
-      payment_method_types: ["card"],
+      // No payment_method_types specified on purpose — Stripe then uses
+      // "dynamic payment methods": whatever's turned on in Dashboard →
+      // Settings → Payment methods, filtered to whatever's actually
+      // eligible for this transaction (currency, browser, device). A
+      // hardcoded ["card"] here would silently override the Dashboard
+      // settings entirely, regardless of what's enabled there.
       customer_email: customer?.email,
       line_items: [
         {
