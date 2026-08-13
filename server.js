@@ -31,6 +31,7 @@ import { getFirestore } from "firebase-admin/firestore";
 import { Storage } from "@google-cloud/storage";
 import crypto from "crypto";
 import rateLimit from "express-rate-limit";
+import { z } from "zod";
 
 dotenv.config();
 
@@ -169,6 +170,95 @@ const generalLimiter = rateLimit({
   message: { error: "Too many requests — please slow down." },
 });
 app.use(generalLimiter);
+
+/* =========================================================================
+   INPUT VALIDATION (Zod)
+
+   Applied to the endpoints that matter most — anything touching payment
+   amounts, cart contents, or account creation. Not every endpoint here
+   has a schema; this covers the highest-value ones deliberately, rather
+   than validating all ~30 routes by hand. Zod's job is purely
+   structural (right types, right shape, present when required) — it
+   never decides whether a price is correct or a login is valid, that's
+   still the existing business logic (computeVerifiedSubtotal, requireAuth,
+   etc.) doing its job exactly as before. This just means malformed data
+   gets a clear, specific 400 error before it ever reaches that logic,
+   instead of causing a confusing crash or an unclear failure deeper in.
+========================================================================= */
+
+function validateBody(schema) {
+  return (req, res, next) => {
+    const result = schema.safeParse(req.body);
+    if (!result.success) {
+      const details = result.error.issues.map((i) => `${i.path.join(".") || "(root)"}: ${i.message}`);
+      return res.status(400).json({ error: "Invalid request.", details });
+    }
+    req.body = result.data; // use the parsed/coerced data from here on
+    next();
+  };
+}
+
+const cartItemSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().max(300).optional(),
+  qty: z.number().int().positive().max(500),
+  kind: z.enum(["glass", "bottle"]),
+  unit: z.number().optional(), // display-only — the real charged price always comes from computeVerifiedSubtotal, never trusted from here
+  modifiers: z.array(z.object({
+    id: z.string(),
+    label: z.string().optional(),
+    priceDelta: z.number().optional(),
+  })).optional(),
+});
+
+const customerSchema = z.object({
+  name: z.string().max(200).optional(),
+  email: z.string().email().or(z.literal("")).optional(),
+  phone: z.string().max(50).optional(),
+}).optional();
+
+const createCheckoutSessionSchema = z.object({
+  currency: z.string().length(3).optional(),
+  table: z.union([z.string(), z.number()]).nullable().optional(),
+  outlet: z.string().min(1).nullable().optional(),
+  customer: customerSchema,
+  items: z.array(cartItemSchema).min(1, "Cart is empty."),
+  returnUrl: z.string().url(),
+  wantsMembership: z.boolean().optional(),
+  marketingConsent: z.boolean().optional(),
+});
+
+const posCompleteOrderSchema = z.object({
+  outlet: z.string().min(1),
+  table: z.union([z.string(), z.number()]).nullable().optional(),
+  items: z.array(cartItemSchema).min(1, "At least one item is required."),
+  customer: customerSchema,
+  wantsMembership: z.boolean().optional(),
+  marketingConsent: z.boolean().optional(),
+});
+
+const loginSchema = z.object({
+  email: z.string().min(1, "Email required."),
+  password: z.string().min(1, "Password required."),
+});
+
+const bootstrapMasterSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8, "Password must be at least 8 characters."),
+  name: z.string().max(200).optional(),
+});
+
+const createUserSchema = z.object({
+  email: z.string().email(),
+  password: z.string().min(8, "Password must be at least 8 characters."),
+  name: z.string().max(200).optional(),
+  role: z.enum(["outlet", "group", "master"]),
+  scope: z.string().nullable().optional(),
+});
+
+const unsubscribeSchema = z.object({
+  email: z.string().min(1, "Email required."),
+});
 
 // The reliable path: looks up what was saved at checkout-creation time
 // (see /create-checkout-session) and writes it into the real orders
@@ -456,7 +546,7 @@ async function resolveTaxSettingsForOutlet(outletId) {
   return taxByChain[chain] || taxByChain.__default || DEFAULT_TAX_SETTINGS;
 }
 
-app.post("/create-checkout-session", async (req, res) => {
+app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), async (req, res) => {
   try {
     const { currency = "sgd", table, outlet, customer, items, returnUrl, wantsMembership, marketingConsent } = req.body;
 
@@ -640,7 +730,7 @@ app.post("/create-checkout-session", async (req, res) => {
 // is readable or writable through this route. Always returns success
 // even if the email isn't a member, so this can't be used to check
 // which emails are registered.
-app.post("/members/unsubscribe", async (req, res) => {
+app.post("/members/unsubscribe", validateBody(unsubscribeSchema), async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
     const email = normalizeEmail(req.body.email);
@@ -707,7 +797,7 @@ app.post("/order-paid", async (req, res) => {
 // Reports/Charts — distinguished only by paymentMethod: "cash" and
 // staffUser (who actually rang it up, for real accountability rather
 // than a generic "walk-in" bucket).
-app.post("/pos/complete-order", requireAuth, async (req, res) => {
+app.post("/pos/complete-order", requireAuth, validateBody(posCompleteOrderSchema), async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
     const { outlet, table, items, customer, wantsMembership, marketingConsent } = req.body;
@@ -1524,7 +1614,7 @@ function normalizeEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
 
-app.post("/auth/login", authLimiter, async (req, res) => {
+app.post("/auth/login", authLimiter, validateBody(loginSchema), async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured — user accounts require Firestore." });
   try {
     const email = normalizeEmail(req.body.email);
@@ -1560,7 +1650,7 @@ app.get("/auth/me", requireAuth, (req, res) => {
 // just the "empty users collection" check) so there's no window after
 // deploying where a stranger who happens to find this URL first could
 // register themselves as master before the real owner does.
-app.post("/auth/bootstrap-master", authLimiter, requireAdminKey, async (req, res) => {
+app.post("/auth/bootstrap-master", authLimiter, requireAdminKey, validateBody(bootstrapMasterSchema), async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
     const existing = await db.collection("users").limit(1).get();
@@ -1588,7 +1678,7 @@ app.post("/auth/bootstrap-master", authLimiter, requireAdminKey, async (req, res
 
 // Master creates any account: an outlet login (scope = outlet id), a
 // group login (scope = chain name, e.g. "WFA Asia"), or another master.
-app.post("/auth/users", requireAuth, requireMaster, async (req, res) => {
+app.post("/auth/users", requireAuth, requireMaster, validateBody(createUserSchema), async (req, res) => {
   if (!db) return res.status(501).json({ error: "Firestore not configured." });
   try {
     const email = normalizeEmail(req.body.email);
