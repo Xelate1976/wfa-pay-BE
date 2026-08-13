@@ -253,7 +253,15 @@ const createUserSchema = z.object({
   password: z.string().min(8, "Password must be at least 8 characters."),
   name: z.string().max(200).optional(),
   role: z.enum(["outlet", "group", "master"]),
-  scope: z.string().nullable().optional(),
+  // Group role: a single chain name string. Outlet role: one or more
+  // outlet ids — accepting both a bare string and an array here so a
+  // single-outlet request doesn't need to be wrapped by the caller.
+  scope: z.union([z.string(), z.array(z.string())]).nullable().optional(),
+});
+
+const editUserSchema = z.object({
+  name: z.string().max(200).optional(),
+  scope: z.union([z.string(), z.array(z.string())]).optional(),
 });
 
 const unsubscribeSchema = z.object({
@@ -1632,8 +1640,9 @@ app.post("/auth/login", authLimiter, validateBody(loginSchema), async (req, res)
       return res.status(401).json({ error: "Invalid email or password." });
     }
 
-    const token = signToken({ userId: email, role: user.role, scope: user.scope ?? null, name: user.name || email });
-    res.json({ token, role: user.role, scope: user.scope ?? null, name: user.name || email });
+    const scope = user.role === "outlet" ? normalizeOutletScope(user.scope) : (user.scope ?? null);
+    const token = signToken({ userId: email, role: user.role, scope, name: user.name || email });
+    res.json({ token, role: user.role, scope, name: user.name || email });
   } catch (e) {
     console.error("login failed:", e.message);
     res.status(500).json({ error: e.message });
@@ -1685,15 +1694,20 @@ app.post("/auth/users", requireAuth, requireMaster, validateBody(createUserSchem
     const password = req.body.password || "";
     const name = req.body.name || email;
     const role = req.body.role; // "outlet" | "group" | "master"
-    const scope = role === "master" ? null : req.body.scope;
+    // Outlet role always stores scope as an array now (one login can
+    // cover several outlets); group role stays a single chain string.
+    const scope = role === "master" ? null : role === "outlet" ? normalizeOutletScope(req.body.scope) : req.body.scope;
     if (!email || password.length < 8) {
       return res.status(400).json({ error: "Email and a password of at least 8 characters are required." });
     }
     if (!["outlet", "group", "master"].includes(role)) {
       return res.status(400).json({ error: 'role must be "outlet", "group", or "master".' });
     }
-    if (role !== "master" && !scope) {
-      return res.status(400).json({ error: "scope is required for outlet/group accounts — an outlet id or a chain name." });
+    if (role === "outlet" && (!scope || scope.length === 0)) {
+      return res.status(400).json({ error: "At least one outlet is required." });
+    }
+    if (role === "group" && !scope) {
+      return res.status(400).json({ error: "scope is required for group accounts — a chain name." });
     }
     const existing = await db.collection("users").doc(email).get();
     if (existing.exists) return res.status(409).json({ error: "An account with this email already exists." });
@@ -1707,6 +1721,50 @@ app.post("/auth/users", requireAuth, requireMaster, validateBody(createUserSchem
     res.json({ ok: true });
   } catch (e) {
     console.error("create user failed:", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Was missing entirely before — Users management only supported
+// create + delete, meaning adding or removing an outlet from an
+// existing login required deleting the whole account and starting
+// over (losing its password in the process, since there's no way to
+// view a hashed password back out). This is what actually lets master
+// adjust an outlet-role account's assigned outlets, or a group
+// account's chain, without that disruption.
+app.patch("/auth/users/:email", requireAuth, requireMaster, validateBody(editUserSchema), async (req, res) => {
+  if (!db) return res.status(501).json({ error: "Firestore not configured." });
+  try {
+    const email = normalizeEmail(req.params.email);
+    const existing = await db.collection("users").doc(email).get();
+    if (!existing.exists) return res.status(404).json({ error: "User not found." });
+    const user = existing.data();
+
+    const patch = {};
+    if (typeof req.body.name === "string" && req.body.name.trim()) patch.name = req.body.name.trim();
+
+    if (req.body.scope !== undefined) {
+      if (user.role === "master") {
+        return res.status(400).json({ error: "Master accounts don't have a scope to edit." });
+      }
+      if (user.role === "outlet") {
+        const scopeArr = normalizeOutletScope(req.body.scope);
+        if (scopeArr.length === 0) return res.status(400).json({ error: "At least one outlet is required." });
+        patch.scope = scopeArr;
+      } else if (user.role === "group") {
+        if (!req.body.scope) return res.status(400).json({ error: "A chain name is required." });
+        patch.scope = req.body.scope;
+      }
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: "Nothing to update." });
+    }
+
+    await db.collection("users").doc(email).set(patch, { merge: true });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error("edit user failed:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
@@ -1796,10 +1854,22 @@ app.post("/store/:key", requireAuth, async (req, res) => {
 // Resolves whether a logged-in user is allowed to see a given order,
 // based on their role/scope. Needs the outlets list to translate a
 // group admin's chain scope into actual outlet ids.
+// scope for an "outlet" role is now an ARRAY of outlet ids (a login can
+// be assigned more than one outlet), not a single string. Normalizing
+// here rather than requiring every caller to know this — old accounts
+// created before this change still have scope stored as a plain
+// string in Firestore; wrapping it in an array here means every check
+// below works identically regardless of which shape a given account
+// happens to have.
+function normalizeOutletScope(scope) {
+  if (Array.isArray(scope)) return scope;
+  return scope ? [scope] : [];
+}
+
 function userCanSeeOutlet(authUser, outletId, outletsList) {
   if (!authUser) return false;
   if (authUser.role === "master") return true;
-  if (authUser.role === "outlet") return authUser.scope === outletId;
+  if (authUser.role === "outlet") return normalizeOutletScope(authUser.scope).includes(outletId);
   if (authUser.role === "group") {
     const outlet = (outletsList || []).find((o) => o.id === outletId);
     return !!outlet && (outlet.chain || "Independent") === authUser.scope;
