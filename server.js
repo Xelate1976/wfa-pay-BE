@@ -1129,7 +1129,16 @@ async function sendTelegramMessage(botToken, chatId, text) {
    but set it before going live).
 --------------------------------------------------------------------- */
 function requireAdminKey(req, res, next) {
-  if (!process.env.ADMIN_API_KEY) return next();
+  // Fails CLOSED now, not open. The old version let every request
+  // through if ADMIN_API_KEY simply wasn't set — meaning any
+  // misconfiguration (a Secret Manager hiccup, a dropped env var)
+  // silently turned every admin-protected endpoint into open access
+  // for anyone, with no error at all. A missing key should mean
+  // "nobody gets in," never "everybody gets in."
+  if (!process.env.ADMIN_API_KEY) {
+    console.error("ADMIN_API_KEY is not set — refusing all admin-key-protected requests until this is fixed.");
+    return res.status(503).json({ error: "Admin access is temporarily unavailable — configuration issue, not your password." });
+  }
   if (req.headers["x-admin-key"] !== process.env.ADMIN_API_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
