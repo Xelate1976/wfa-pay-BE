@@ -643,7 +643,7 @@ async function computeVerifiedSubtotal(outletId, items) {
 async function resolveTaxSettingsForOutlet(outletId) {
   const [outletsDoc, taxDoc] = await Promise.all([
     db.collection("kv").doc("wfa-outlets").get(),
-    db.collection("kv").doc("wfa-tax-settings-by-chain").get(),
+    db.collection("kv").doc("wfa-tax-settings").get(),
   ]);
   const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
   const taxByChain = taxDoc.exists ? taxDoc.data().value || {} : {};
