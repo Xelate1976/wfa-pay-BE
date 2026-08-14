@@ -740,6 +740,16 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     const requestId = crypto.randomUUID();
     const merchantOrderId = `wfa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+    // ⚠️ Bug found in real testing, fixed here: an earlier version of
+    // this call also sent an `order.products` itemized breakdown
+    // (unit prices × quantities), purely as a nice-to-have. That
+    // breakdown only ever summed to the SUBTOTAL — it never included
+    // GST or service charge as their own line items — and Airwallex's
+    // hosted page evidently trusts that itemized breakdown for what it
+    // actually charges, not just the flat `amount` field below. The
+    // real fix is simply not sending it: `amount` alone (the full,
+    // server-verified total including GST + service charge) is all
+    // that's actually required for the charge to be correct.
     const intent = await airwallexRequest("/api/v1/pa/payment_intents/create", {
       method: "POST",
       body: JSON.stringify({
@@ -748,9 +758,6 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
         currency: currency.toUpperCase(),
         merchant_order_id: merchantOrderId,
         return_url: returnUrl,
-        order: {
-          products: verifiedItems.map((i) => ({ name: i.name, quantity: i.qty, unit_price: i.unit })),
-        },
         metadata: {
           table: table ? String(table) : "",
           outlet: outlet ? String(outlet) : "",
