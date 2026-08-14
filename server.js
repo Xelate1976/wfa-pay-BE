@@ -761,16 +761,16 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
       quantity: i.qty,
     }));
     if (serviceCharge > 0) {
-      orderProducts.push({ name: `Service Charge (${totals.serviceChargeRate}%)`, unit_price: serviceCharge, quantity: 1 });
+      orderProducts.push({ name: `Service Charge (${totals.serviceChargeRate}%)`, unit_price: serviceCharge });
     }
     if (gst > 0) {
-      orderProducts.push({ name: `GST (${totals.gstRate}%)`, unit_price: gst, quantity: 1 });
+      orderProducts.push({ name: `GST (${totals.gstRate}%)`, unit_price: gst });
     }
     if (discountApplied && discountAmount > 0) {
-      orderProducts.push({ name: "Membership Discount", unit_price: -discountAmount, quantity: 1 });
+      orderProducts.push({ name: "Membership Discount", unit_price: -discountAmount });
     }
 
-    const productsSum = +orderProducts.reduce((sum, p) => sum + p.unit_price * p.quantity, 0).toFixed(2);
+    const productsSum = +orderProducts.reduce((sum, p) => sum + p.unit_price * (p.quantity ?? 1), 0).toFixed(2);
     if (productsSum !== finalAmount) {
       console.error(`create-checkout-session: order.products sum (${productsSum}) does not match finalAmount (${finalAmount}) — refusing to send the itemized breakdown to avoid the undercharge bug seen before.`);
       return res.status(500).json({ error: "Internal pricing mismatch — please try again or contact staff." });
