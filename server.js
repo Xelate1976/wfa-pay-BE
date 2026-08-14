@@ -2,20 +2,22 @@
  * WFA Asia — payments backend
  * -----------------------------------------------------------------------
  * Minimal Express server that:
- *   1. Creates a Stripe Checkout Session for a cart total and hands back
- *      its hosted URL. The app opens that URL in a new browser tab —
- *      Stripe's own page collects the card, so no card-handling code or
- *      script ever needs to load inside the ordering app itself.
- *   2. Lets the app poll a session's status after opening it (since the
- *      payment happens in a separate tab, there's no direct callback).
+ *   1. Creates an Airwallex PaymentIntent for a cart total and hands
+ *      back its id + client_secret. The frontend uses Airwallex's own
+ *      JS library to redirect to their hosted payment page — no card-
+ *      handling code lives in the ordering app itself, same principle
+ *      as the Stripe integration this replaced, different mechanics.
+ *   2. Lets the app poll a PaymentIntent's status after opening it
+ *      (since the payment happens on a separate page, there's no
+ *      direct callback).
  *   3. Verifies successful payments and fires WhatsApp (Green-API) +
  *      email (Resend) notifications, via two paths that both call
  *      notifyOnPayment():
- *        - the webhook below (checkout.session.completed) — the
+ *        - the webhook below (payment_intent.succeeded) — the
  *          reliable source of truth, fires even if the guest never
  *          returns to the ordering tab.
  *        - /order-paid — a convenience call the app makes once it sees
- *          (via polling) that the session succeeded, for instant
+ *          (via polling) that the payment succeeded, for instant
  *          feedback without waiting on the webhook round trip.
  *
  * This file is a starting point, not a finished production server —
@@ -24,7 +26,6 @@
  */
 import express from "express";
 import cors from "cors";
-import Stripe from "stripe";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
 import { getFirestore } from "firebase-admin/firestore";
@@ -35,8 +36,71 @@ import { z } from "zod";
 
 dotenv.config();
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
+
+/* =========================================================================
+   AIRWALLEX — replaces Stripe for online checkout entirely.
+
+   Genuinely different auth model from Stripe: Stripe uses one static
+   secret key forever. Airwallex requires exchanging a Client ID + API
+   Key for a short-lived Bearer access token first, then using THAT for
+   every subsequent call — so this needs its own small token cache with
+   expiry tracking, re-authenticating only when the cached token is
+   actually about to expire rather than on every single request.
+
+   AIRWALLEX_ENDPOINT is an env var (not hardcoded) specifically so
+   switching between sandbox and production is a config change, not a
+   code change.
+========================================================================= */
+const AIRWALLEX_ENDPOINT = process.env.AIRWALLEX_ENDPOINT || "https://api.sandbox.airwallex.com";
+const AIRWALLEX_CLIENT_ID = process.env.AIRWALLEX_CLIENT_ID;
+const AIRWALLEX_API_KEY = process.env.AIRWALLEX_API_KEY;
+
+let airwallexTokenCache = { token: null, expiresAt: 0 };
+
+async function getAirwallexAccessToken() {
+  // 60s safety margin — refresh a little before actual expiry rather
+  // than racing a request that starts right as the cached token dies.
+  if (airwallexTokenCache.token && Date.now() < airwallexTokenCache.expiresAt - 60000) {
+    return airwallexTokenCache.token;
+  }
+  const res = await fetch(`${AIRWALLEX_ENDPOINT}/api/v1/authentication/login`, {
+    method: "POST",
+    headers: {
+      "x-client-id": AIRWALLEX_CLIENT_ID,
+      "x-api-key": AIRWALLEX_API_KEY,
+      "Content-Type": "application/json",
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Airwallex authentication failed (${res.status}): ${body}`);
+  }
+  const data = await res.json();
+  airwallexTokenCache = {
+    token: data.token,
+    expiresAt: new Date(data.expires_at).getTime(),
+  };
+  return airwallexTokenCache.token;
+}
+
+async function airwallexRequest(path, options = {}) {
+  const token = await getAirwallexAccessToken();
+  const res = await fetch(`${AIRWALLEX_ENDPOINT}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.message || `Airwallex request to ${path} failed (${res.status})`);
+  }
+  return data;
+}
+
 
 /* ---------------------------------------------------------------------
    Firestore — this is the real persistent store. Orders, the menu,
@@ -324,12 +388,12 @@ async function assignOrderAndQueueNumbers(outletId) {
   }
 }
 
-async function recordOrderFromSession(session) {
+async function recordOrderFromPaymentIntent(intent) {
   if (!db) return { orderNumber: null, queueNumber: null };
   try {
-    const pendingDoc = await db.collection("checkoutPending").doc(session.id).get();
+    const pendingDoc = await db.collection("checkoutPending").doc(intent.id).get();
     if (!pendingDoc.exists) {
-      console.error(`recordOrderFromSession: no checkoutPending record for ${session.id} — order may only exist if the guest's browser completed the return trip.`);
+      console.error(`recordOrderFromPaymentIntent: no checkoutPending record for ${intent.id} — order may only exist if the guest's browser completed the return trip.`);
       return { orderNumber: null, queueNumber: null };
     }
     const p = pendingDoc.data();
@@ -339,7 +403,7 @@ async function recordOrderFromSession(session) {
     // reuse it rather than generating a fresh one — otherwise a race
     // between the two paths could burn two numbers for one order
     // (harmless — just a skipped number in the sequence — but avoidable).
-    const existingDoc = await db.collection("orders").doc(session.id).get();
+    const existingDoc = await db.collection("orders").doc(intent.id).get();
     let orderNumber, queueNumber;
     if (existingDoc.exists && existingDoc.data().orderNumber) {
       orderNumber = existingDoc.data().orderNumber;
@@ -351,12 +415,15 @@ async function recordOrderFromSession(session) {
     }
 
     const order = {
-      id: session.id,
+      id: intent.id,
       ts: p.createdAt || new Date().toISOString(),
       orderNumber,
       queueNumber,
       items: p.items || [],
-      total: +(session.amount_total / 100).toFixed(2),
+      // Airwallex amounts are already in major units (29.00, not
+      // 2900 like Stripe's cents) — no /100 conversion here, unlike
+      // the old Stripe version of this function.
+      total: +Number(intent.amount).toFixed(2),
       subtotal: p.subtotal,
       serviceCharge: p.serviceCharge,
       gst: p.gst,
@@ -365,46 +432,76 @@ async function recordOrderFromSession(session) {
       phone: p.customerPhone || "",
       outlet: p.outlet || null,
       table: p.table || null,
-      sessionId: session.id,
+      sessionId: intent.id,
       live: true,
     };
-    await db.collection("orders").doc(session.id).set(order);
+    await db.collection("orders").doc(intent.id).set(order);
     return { orderNumber, queueNumber };
   } catch (e) {
-    console.error("recordOrderFromSession failed:", e.message);
+    console.error("recordOrderFromPaymentIntent failed:", e.message);
     return { orderNumber: null, queueNumber: null };
   }
 }
 
 
 /* ---------------------------------------------------------------------
-   Stripe webhook — must read the RAW body, so this is mounted before
-   express.json(). Register this URL + the checkout.session.completed
-   event in the Stripe dashboard (or `stripe listen` for local testing).
-   See README.
+   Airwallex webhook — must read the RAW body, so this is mounted
+   before express.json(), same requirement as the old Stripe version.
+   Register this URL in the Airwallex web app under Developer →
+   Webhooks, subscribed to "All events in Payment Intents" — that
+   generates the webhook's own secret key, which goes in
+   AIRWALLEX_WEBHOOK_SECRET.
+
+   Signature scheme confirmed directly from Airwallex's own docs and
+   Node.js code sample: HMAC-SHA256(secret, x-timestamp + rawBody),
+   hex digest, compared to the x-signature header. This is genuinely
+   different from Stripe's scheme (different header names, different
+   digest encoding), not just a renamed copy of the old logic.
+
+   ⚠️ One thing worth verifying once a real test webhook comes through:
+   the exact nested shape of a payment_intent.succeeded event body
+   (this assumes `event.name` and `event.data.object`, mirroring the
+   pattern Airwallex's own docs show for other event types) — logged
+   in full below so this is easy to confirm/adjust against the real
+   payload rather than guessing twice.
 --------------------------------------------------------------------- */
 app.post(
   "/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
-    let event;
     try {
-      event = stripe.webhooks.constructEvent(
-        req.body,
-        req.headers["stripe-signature"],
-        process.env.STRIPE_WEBHOOK_SECRET
-      );
+      const timestamp = req.headers["x-timestamp"];
+      const signature = req.headers["x-signature"];
+      const rawBody = req.body.toString(); // Buffer from express.raw() — must sign the exact raw bytes, not a re-serialized version
+      const expectedSignature = crypto
+        .createHmac("sha256", process.env.AIRWALLEX_WEBHOOK_SECRET)
+        .update(`${timestamp}${rawBody}`)
+        .digest("hex");
+
+      const a = Buffer.from(signature || "", "hex");
+      const b = Buffer.from(expectedSignature, "hex");
+      if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+        console.error("Airwallex webhook signature verification failed.");
+        return res.sendStatus(400);
+      }
+
+      const event = JSON.parse(rawBody);
+      console.log("Airwallex webhook received:", JSON.stringify(event).slice(0, 500)); // temporary — helps confirm the real payload shape against what's assumed below
+
+      if (event.name === "payment_intent.succeeded") {
+        const intent = event.data?.object || event.data;
+        await notifyOnPayment({
+          amountCents: Math.round(Number(intent.amount) * 100),
+          metadata: intent.metadata || {},
+          sessionId: intent.id,
+        });
+        await recordOrderFromPaymentIntent(intent);
+      }
+      res.json({ received: true });
     } catch (err) {
-      console.error("Webhook signature verification failed:", err.message);
+      console.error("Webhook processing failed:", err.message);
       return res.sendStatus(400);
     }
-
-    if (event.type === "checkout.session.completed") {
-      const session = event.data.object;
-      await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata, sessionId: session.id });
-      await recordOrderFromSession(session);
-    }
-    res.json({ received: true });
   }
 );
 
@@ -569,11 +666,9 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     }
 
     // Real price verification — subtotal, GST, and service charge are
-    // now derived entirely from the actual menu and actual tax settings
-    // in Firestore, never from whatever the request body claims. See
-    // the SERVER-SIDE PRICE VERIFICATION block above for why this
-    // matters: without it, a modified request could set any price at
-    // all for what Stripe actually charges.
+    // derived entirely from the actual menu and actual tax settings in
+    // Firestore, never from whatever the request body claims. Fully
+    // gateway-agnostic — unchanged from when this called Stripe.
     let subtotal, serviceCharge, gst, totals, verifiedItems;
     try {
       const verified = await computeVerifiedSubtotal(outlet, items);
@@ -587,21 +682,22 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
       return res.status(400).json({ error: e.message });
     }
 
-    const amount = Math.round(totals.total * 100); // Stripe wants integer cents
-    if (amount < 50) {
-      return res.status(400).json({ error: "Order total is below Stripe's minimum chargeable amount." });
+    // Airwallex amounts are in MAJOR units (29.00), not cents like
+    // Stripe (2900) — this is a real, confirmed difference, not a
+    // rounding preference. No *100 conversion anywhere in this route.
+    const amount = totals.total;
+    if (amount < 0.5) {
+      return res.status(400).json({ error: "Order total is below the minimum chargeable amount." });
     }
 
     // Membership + first-order discount — deliberately entirely
-    // server-side. Eligibility is decided here, never trusted from the
-    // browser, and the discount is baked directly into the real Stripe
-    // amount below — never just a display-only trick in the UI. See
-    // README for the PDPA consent design this is built around: the
-    // discount checkbox and the marketing checkbox are two separate,
-    // independently-tracked consents, never bundled into one.
+    // server-side, exactly as before. Eligibility is decided here,
+    // never trusted from the browser, and the discount is baked
+    // directly into the real Airwallex PaymentIntent amount below —
+    // never just a display-only trick in the UI.
     let finalAmount = amount;
     let discountApplied = false;
-    let discountCents = 0;
+    let discountAmount = 0;
     const email = normalizeEmail(customer?.email);
 
     if (wantsMembership && db && email) {
@@ -611,9 +707,6 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
           const doc = await t.get(memberRef);
           const alreadyUsed = doc.exists && doc.data().firstOrderDiscountUsed;
           if (alreadyUsed) {
-            // Still record/update marketing preference even if the
-            // discount itself was already used on a prior visit — the
-            // two consents are independent of each other.
             if (typeof marketingConsent === "boolean") {
               t.set(memberRef, { marketingConsent, marketingConsentUpdatedAt: new Date().toISOString() }, { merge: true });
             }
@@ -633,79 +726,54 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
           return true;
         });
         if (discountApplied) {
-          discountCents = Math.round(amount * 0.10);
-          finalAmount = Math.max(50, amount - discountCents); // Stripe minimum still applies
+          discountAmount = +(amount * 0.10).toFixed(2);
+          finalAmount = Math.max(0.5, +(amount - discountAmount).toFixed(2));
         }
       } catch (e) {
         console.error(`Membership discount check failed for ${email}, proceeding without discount:`, e.message);
       }
     }
 
-    // Bug fixed: this used to send guests to a static "you can close this
-    // tab" page on the backend and rely on the ORIGINAL tab silently
-    // polling in the background to notice payment succeeded. That's
-    // fragile on mobile (background tabs get throttled/killed) and,
-    // worse, never actually brings the guest back automatically. Stripe's
-    // own recommended pattern is simpler and more reliable: redirect in
-    // the SAME tab, back to the app's own URL, with the session id
-    // attached — the app checks for that on load and shows the receipt.
-    // {CHECKOUT_SESSION_ID} is a literal placeholder Stripe fills in.
-    const successUrl = `${returnUrl}?session_id={CHECKOUT_SESSION_ID}&paid=1`;
-    const cancelUrl = `${returnUrl}?paid=0`;
+    // request_id is Airwallex's idempotency key — a v4 UUID, per their
+    // docs, ensures a retried call with the same id is only processed
+    // once rather than double-charging.
+    const requestId = crypto.randomUUID();
+    const merchantOrderId = `wfa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "payment",
-      // No payment_method_types specified on purpose — Stripe then uses
-      // "dynamic payment methods": whatever's turned on in Dashboard →
-      // Settings → Payment methods, filtered to whatever's actually
-      // eligible for this transaction (currency, browser, device). A
-      // hardcoded ["card"] here would silently override the Dashboard
-      // settings entirely, regardless of what's enabled there.
-      customer_email: customer?.email,
-      line_items: [
-        {
-          price_data: {
-            currency,
-            product_data: {
-              name: `WFA Asia order${table ? ` — Table ${table}` : ""}${discountApplied ? " (10% member discount applied)" : ""}`,
-              description: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500) || undefined,
-            },
-            unit_amount: finalAmount,
-          },
-          quantity: 1,
+    const intent = await airwallexRequest("/api/v1/pa/payment_intents/create", {
+      method: "POST",
+      body: JSON.stringify({
+        request_id: requestId,
+        amount: finalAmount,
+        currency: currency.toUpperCase(),
+        merchant_order_id: merchantOrderId,
+        return_url: returnUrl,
+        order: {
+          products: verifiedItems.map((i) => ({ name: i.name, quantity: i.qty, unit_price: i.unit })),
         },
-      ],
-      metadata: {
-        table: table ? String(table) : "",
-        outlet: outlet ? String(outlet) : "",
-        customerName: customer?.name || "",
-        customerEmail: customer?.email || "",
-        customerPhone: customer?.phone || "",
-        items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
-        memberDiscountApplied: discountApplied ? "1" : "0",
-      },
-      success_url: successUrl,
-      cancel_url: cancelUrl,
+        metadata: {
+          table: table ? String(table) : "",
+          outlet: outlet ? String(outlet) : "",
+          customerName: customer?.name || "",
+          customerEmail: customer?.email || "",
+          customerPhone: customer?.phone || "",
+          items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+          memberDiscountApplied: discountApplied ? "1" : "0",
+        },
+      }),
     });
 
-    // ⚠️ Critical for reliability: the order used to only ever get
-    // saved by the GUEST'S OWN BROWSER, after Stripe redirected them
-    // back here. If that round trip never completes — tab closed right
-    // after paying, connection drops, phone dies, anything — the guest
-    // was genuinely charged, but no order record was ever created, and
-    // the restaurant has no way to know the payment happened.
-    //
-    // Fixing that: the full order gets saved here, right now, BEFORE
-    // the guest even reaches Stripe's page — marked not-yet-paid, keyed
-    // by this session's id. The webhook below (which Stripe calls
-    // server-to-server, independent of the guest's device entirely)
-    // is what actually confirms and finalizes it once payment succeeds.
-    // That's the reliable path now; the guest's own browser completing
-    // the return trip is just a nice-to-have for instant UI feedback,
-    // no longer the only way an order gets recorded.
+    // ⚠️ Same reliability pattern as before, just keyed by Airwallex's
+    // PaymentIntent id instead of a Stripe session id: the full order
+    // gets saved here, right now, BEFORE the guest even reaches
+    // Airwallex's page — marked not-yet-paid. The webhook (server-to-
+    // server, independent of the guest's device) is what actually
+    // confirms and finalizes it once payment succeeds. The guest's own
+    // browser completing the return trip is just a nice-to-have for
+    // instant UI feedback, never the only way an order gets recorded.
     if (db) {
       try {
-        await db.collection("checkoutPending").doc(session.id).set({
+        await db.collection("checkoutPending").doc(intent.id).set({
           items: verifiedItems,
           table: table ? String(table) : null,
           outlet: outlet || null,
@@ -716,7 +784,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
           customerEmail: customer?.email || "",
           customerPhone: customer?.phone || "",
           memberDiscountApplied: discountApplied,
-          memberDiscountCents: discountCents,
+          memberDiscountAmount: discountAmount,
           createdAt: new Date().toISOString(),
         });
       } catch (e) {
@@ -724,7 +792,14 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
       }
     }
 
-    res.json({ url: session.url, sessionId: session.id, discountApplied, discountCents, finalAmount });
+    res.json({
+      intentId: intent.id,
+      clientSecret: intent.client_secret,
+      currency: currency.toUpperCase(),
+      discountApplied,
+      discountAmount,
+      finalAmount,
+    });
   } catch (err) {
     console.error("create-checkout-session failed:", err.message);
     res.status(500).json({ error: err.message });
@@ -756,16 +831,16 @@ app.post("/members/unsubscribe", validateBody(unsubscribeSchema), async (req, re
 });
 
 /* ---------------------------------------------------------------------
-   2. Poll this to find out if a session has been paid yet. The app
-   calls it every couple of seconds after opening the Checkout tab.
+   2. Poll this to find out if a payment has succeeded yet. The app
+   calls it every couple of seconds after opening the payment tab.
 --------------------------------------------------------------------- */
 app.get("/checkout-session/:id", async (req, res) => {
   try {
-    const session = await stripe.checkout.sessions.retrieve(req.params.id);
+    const intent = await airwallexRequest(`/api/v1/pa/payment_intents/${req.params.id}`, { method: "GET" });
     res.json({
-      status: session.payment_status, // "paid" | "unpaid" | "no_payment_required"
-      amountTotal: session.amount_total,
-      metadata: session.metadata,
+      status: intent.status === "SUCCEEDED" ? "paid" : "unpaid", // normalized to the same "paid"/"unpaid" shape the frontend already expects
+      amountTotal: Math.round(Number(intent.amount) * 100), // kept in cents here for frontend consistency with how amounts were always displayed
+      metadata: intent.metadata,
     });
   } catch (err) {
     console.error("checkout-session lookup failed:", err.message);
@@ -775,21 +850,21 @@ app.get("/checkout-session/:id", async (req, res) => {
 
 /* ---------------------------------------------------------------------
    3. Convenience confirmation — called by the app right after polling
-   shows a session is paid. We re-check with Stripe (never trust the
-   client's word alone) before sending notifications.
+   shows a payment succeeded. We re-check with Airwallex directly
+   (never trust the client's word alone) before sending notifications.
 --------------------------------------------------------------------- */
 app.post("/order-paid", async (req, res) => {
   try {
-    const { sessionId } = req.body;
+    const { sessionId } = req.body; // kept as "sessionId" for frontend compatibility — actually an Airwallex PaymentIntent id now
     if (!sessionId) return res.status(400).json({ error: "sessionId required" });
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-    if (session.payment_status !== "paid") {
-      return res.status(400).json({ error: `Payment not confirmed (status: ${session.payment_status})` });
+    const intent = await airwallexRequest(`/api/v1/pa/payment_intents/${sessionId}`, { method: "GET" });
+    if (intent.status !== "SUCCEEDED") {
+      return res.status(400).json({ error: `Payment not confirmed (status: ${intent.status})` });
     }
 
-    await notifyOnPayment({ amountCents: session.amount_total, metadata: session.metadata, sessionId });
-    const { orderNumber, queueNumber } = await recordOrderFromSession(session);
+    await notifyOnPayment({ amountCents: Math.round(Number(intent.amount) * 100), metadata: intent.metadata || {}, sessionId });
+    const { orderNumber, queueNumber } = await recordOrderFromPaymentIntent(intent);
     res.json({ ok: true, orderNumber, queueNumber });
   } catch (err) {
     console.error("order-paid failed:", err.message);
