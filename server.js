@@ -741,17 +741,42 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     const requestId = crypto.randomUUID();
     const merchantOrderId = `wfa-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // ⚠️ Bug found in real testing, fixed here: an earlier version of
-    // this call also sent an `order.products` itemized breakdown
-    // (unit prices × quantities), purely as a nice-to-have. That
-    // breakdown only ever summed to the SUBTOTAL — it never included
-    // GST or service charge as their own line items — and Airwallex's
-    // hosted page evidently trusts that itemized breakdown for what it
-    // actually charges, not just the flat `amount` field below. The
-    // real fix is simply not sending it: `amount` alone (the full,
-    // server-verified total including GST + service charge) is all
-    // that's actually required for the charge to be correct.
-    console.log(`create-checkout-session: sending finalAmount=${finalAmount} to Airwallex (discountApplied=${discountApplied} discountAmount=${discountAmount})`); // temporary — tracing the $10 vs $11.99 discrepancy
+    // ⚠️ Previously, this call sent NO order.products at all — a prior
+    // version's itemized breakdown only summed to the SUBTOTAL (missing
+    // GST/service charge as their own lines), and Airwallex's hosted
+    // page was found in real testing to charge based on the SUM of
+    // order.products rather than the flat `amount` field whenever both
+    // are present. That silently undercharged to just the subtotal.
+    //
+    // To bring back the itemized breakdown (so guests actually see the
+    // GST/service-charge math on the payment page) without repeating
+    // that bug, every cent of finalAmount is now represented as its own
+    // line — including a NEGATIVE line for the membership discount when
+    // one applies — and the sum is verified in code before the request
+    // is ever sent. If it doesn't match finalAmount exactly, checkout is
+    // refused rather than risking a silent under/overcharge.
+    const orderProducts = verifiedItems.map((i) => ({
+      name: `${i.name} (${i.kind})`.slice(0, 255),
+      unit_price: i.unit,
+      quantity: i.qty,
+    }));
+    if (serviceCharge > 0) {
+      orderProducts.push({ name: `Service Charge (${totals.serviceChargeRate}%)`, unit_price: serviceCharge, quantity: 1 });
+    }
+    if (gst > 0) {
+      orderProducts.push({ name: `GST (${totals.gstRate}%)`, unit_price: gst, quantity: 1 });
+    }
+    if (discountApplied && discountAmount > 0) {
+      orderProducts.push({ name: "Membership Discount", unit_price: -discountAmount, quantity: 1 });
+    }
+
+    const productsSum = +orderProducts.reduce((sum, p) => sum + p.unit_price * p.quantity, 0).toFixed(2);
+    if (productsSum !== finalAmount) {
+      console.error(`create-checkout-session: order.products sum (${productsSum}) does not match finalAmount (${finalAmount}) — refusing to send the itemized breakdown to avoid the undercharge bug seen before.`);
+      return res.status(500).json({ error: "Internal pricing mismatch — please try again or contact staff." });
+    }
+
+    console.log(`create-checkout-session: sending finalAmount=${finalAmount} to Airwallex (discountApplied=${discountApplied} discountAmount=${discountAmount}, productsSum=${productsSum})`); // temporary — tracing the $10 vs $11.99 discrepancy
     const intent = await airwallexRequest("/api/v1/pa/payment_intents/create", {
       method: "POST",
       body: JSON.stringify({
@@ -760,6 +785,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
         currency: currency.toUpperCase(),
         merchant_order_id: merchantOrderId,
         return_url: returnUrl,
+        order: { products: orderProducts },
         metadata: {
           table: table ? String(table) : "",
           outlet: outlet ? String(outlet) : "",
