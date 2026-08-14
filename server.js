@@ -686,6 +686,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     // Stripe (2900) — this is a real, confirmed difference, not a
     // rounding preference. No *100 conversion anywhere in this route.
     const amount = totals.total;
+    console.log(`create-checkout-session: subtotal=${subtotal} serviceCharge=${serviceCharge} gst=${gst} totals.total=${totals.total} amount=${amount}`); // temporary — tracing the $10 vs $11.99 discrepancy
     if (amount < 0.5) {
       return res.status(400).json({ error: "Order total is below the minimum chargeable amount." });
     }
@@ -750,6 +751,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     // real fix is simply not sending it: `amount` alone (the full,
     // server-verified total including GST + service charge) is all
     // that's actually required for the charge to be correct.
+    console.log(`create-checkout-session: sending finalAmount=${finalAmount} to Airwallex (discountApplied=${discountApplied} discountAmount=${discountAmount})`); // temporary — tracing the $10 vs $11.99 discrepancy
     const intent = await airwallexRequest("/api/v1/pa/payment_intents/create", {
       method: "POST",
       body: JSON.stringify({
@@ -769,6 +771,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
         },
       }),
     });
+    console.log(`create-checkout-session: Airwallex responded with intent.id=${intent.id} intent.amount=${intent.amount} intent.currency=${intent.currency}`); // temporary — tracing the $10 vs $11.99 discrepancy
 
     // ⚠️ Same reliability pattern as before, just keyed by Airwallex's
     // PaymentIntent id instead of a Stripe session id: the full order
