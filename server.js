@@ -687,14 +687,25 @@ async function computeVerifiedSubtotal(outletId, items) {
 }
 
 async function resolveTaxSettingsForOutlet(outletId) {
-  const [outletsDoc, taxDoc] = await Promise.all([
+  const [outletsDoc, taxDoc, overridesDoc] = await Promise.all([
     db.collection("kv").doc("wfa-outlets").get(),
     db.collection("kv").doc("wfa-tax-settings").get(),
+    db.collection("kv").doc("wfa-tax-overrides").get(),
   ]);
   const outletsList = outletsDoc.exists ? outletsDoc.data().value || [] : [];
   const taxByChain = taxDoc.exists ? taxDoc.data().value || {} : {};
+  const taxOverrides = overridesDoc.exists ? overridesDoc.data().value || {} : {};
   const chain = outletId ? outletsList.find((o) => o.id === outletId)?.chain : DEFAULT_CHAIN;
-  return taxByChain[chain] || taxByChain.__default || DEFAULT_TAX_SETTINGS;
+  const base = taxByChain[chain] || taxByChain.__default || DEFAULT_TAX_SETTINGS;
+  // A chain's GST/service-charge settings are the default for every
+  // outlet under it, but a specific outlet (e.g. one that's GST-exempt,
+  // or doesn't collect a service charge) can override any subset of
+  // those fields — same "starts from the group default, overridable
+  // per-outlet" pattern already used for menu pricing overrides. Only
+  // fields actually present in the override object take precedence;
+  // anything left unset still falls through to the chain's setting.
+  const outletOverride = outletId ? taxOverrides[outletId] : null;
+  return outletOverride ? { ...base, ...outletOverride } : base;
 }
 
 app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), async (req, res) => {
