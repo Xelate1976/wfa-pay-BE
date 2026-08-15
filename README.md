@@ -23,6 +23,19 @@ WhatsApp, Telegram, and email. Serves every WFA Asia frontend —
 - **Server-verified pricing** — every checkout amount (online and POS)
   is computed from the real menu and real tax settings in Firestore,
   never trusted from the request itself
+- **Per-outlet tax overrides** — GST/service charge default to the
+  chain's settings, but any specific outlet can override either (e.g.
+  one GST-exempt location, or one that doesn't collect a service
+  charge) — resolved server-side in `resolveTaxSettingsForOutlet()`,
+  the same function that decides what a guest is actually charged
+- **Modifier selections are fully recorded** — which options a guest
+  picked (not just the base item) are validated, priced, and saved on
+  the order itself (`unitLabel`, `modifiers[]`, `modifierSummary`),
+  flowing through to Airwallex's checkout breakdown, notifications, and
+  Reports — not discarded after pricing the way it used to be
+- **Geocoding for the Sales Map** — `/outlets/geocode` turns a
+  merchant-entered address into lat/lng, using a backend-only Google
+  Geocoding API key (never exposed to the browser) — see Security below
 - **Airwallex hosted payment page + webhook** — creates PaymentIntents,
   records paid orders reliably (survives a guest's browser never
   completing the return trip), fires notifications
@@ -67,6 +80,7 @@ WhatsApp, Telegram, and email. Serves every WFA Asia frontend —
 | `AIRWALLEX_API_KEY` | Airwallex API Key — never exposed client-side, unlike Stripe's old publishable key which needed a frontend counterpart |
 | `AIRWALLEX_WEBHOOK_SECRET` | Signing secret from the registered webhook (Airwallex web app → Developer → Webhooks) |
 | `AIRWALLEX_ENDPOINT` | API base URL — `https://api.sandbox.airwallex.com` for testing, swap to the production URL when going live. Not sensitive, kept as a plain var (not a secret) |
+| `GOOGLE_GEOCODING_API_KEY` | Backend-only key for turning outlet addresses into map coordinates (`/outlets/geocode`). **Must be unrestricted** (no HTTP-referrer restriction) — that restriction only works for browser requests, and this call is server-to-server. Restrict its **API access** to Geocoding API only instead. Kept in Secret Manager. See "Geocoding key gotchas" below — this one has bitten before |
 | `ALLOWED_ORIGIN` | **Comma-separated** list of every frontend's deployed origin — no trailing slashes, no spaces around commas |
 | `AUTH_TOKEN_SECRET` | Long random string signing login tokens. If unset, a temporary one is generated per process — every login gets invalidated on the next restart/redeploy, fine for testing, not for real use |
 | `ADMIN_API_KEY` | Shared secret protecting `/outlet-secrets/*` and `/auth/bootstrap-master` |
@@ -149,6 +163,37 @@ rather than risking a silent under/overcharge. If this check is ever
 tripped in production, treat it as a real bug worth investigating
 immediately, not a fluke to retry past — it means the itemized
 breakdown and the actual verified total have diverged.
+
+### Per-outlet tax override resolution — the exact order that matters
+`resolveTaxSettingsForOutlet(outletId)` is the single source of truth
+for what GST/service charge a guest is actually charged. Resolution
+order: **outlet's own override fields (if any) win, anything not
+explicitly overridden falls through to the chain's setting, and the
+chain falls through to `DEFAULT_TAX_SETTINGS` if nothing's configured
+at all.** An override is a *partial* object — only the fields present
+on it apply; a merchant enabling "Custom settings" for an outlet in
+the dashboard always writes the **complete** five-field object
+(`gstEnabled`, `gstRate`, `gstMode`, `serviceChargeEnabled`,
+`serviceChargeRate`), not a diff, so once an outlet has an override it
+stops following *future* chain-level changes for those fields until
+the merchant explicitly reverts it to "Use chain default" (which
+deletes that outlet's entry from `wfa-tax-overrides` entirely).
+
+### Modifier selections are validated, priced, AND recorded
+`computeVerifiedSubtotal()` does three things with a cart line's
+modifier selections, not just the first two it used to: (1) validates
+each selected option id actually belongs to that menu item's
+`modifierGroup`, (2) sums each option's real `priceDelta` (never
+trusting a client-sent price), and (3) **keeps the resolved
+selections** — `modifiers: [{id, label, priceDelta}, ...]` (one entry
+per unit chosen — "3x Malbec" is three separate entries) plus a
+pre-grouped `modifierSummary` string ("Malbec ×3, Cabernet ×5") — on
+the object it returns. That object is what gets saved to the order in
+Firestore, sent to Airwallex as the line-item name, and used in
+WhatsApp/Telegram/email notification text. Before this existed, a
+modifier selection was priced correctly but then discarded — the
+saved order only ever showed the base item name, and Reports had
+nothing to show for which wine was actually poured.
 
 ### Secrets — Google Secret Manager, not plain env vars
 `AIRWALLEX_CLIENT_ID`, `AIRWALLEX_API_KEY`, `AIRWALLEX_WEBHOOK_SECRET`,
@@ -361,6 +406,40 @@ orders in Reports.
 
 ---
 
+---
+
+## Sales Map — geocoding
+
+`POST /outlets/geocode` (requires login) takes `{ address }`, calls
+Google's Geocoding API server-side with `GOOGLE_GEOCODING_API_KEY`,
+and returns `{ lat, lng, formattedAddress }`. Called from the
+dashboard's Outlets → 📍 Add location panel, **once per outlet, only
+when a merchant actually enters or changes an address** — not on
+every Sales Map load. The resulting lat/lng is cached directly on the
+outlet record in `wfa-outlets`, so opening the map itself never
+triggers a fresh geocoding call.
+
+**Setup, in order:**
+1. In the same Google Cloud project already running this backend,
+   enable **Geocoding API** (APIs & Services → Library)
+2. Create a **new, separate** API key (Credentials → Create
+   credentials → API key) — do not reuse the Maps JavaScript API key
+   from the frontend
+3. Application restrictions: **None** (this key is never sent to a
+   browser — restricting by referrer would break it, see the gotcha
+   below)
+4. API restrictions: restrict to **Geocoding API only**
+5. Add the key to Cloud Run as `GOOGLE_GEOCODING_API_KEY`, ideally via
+   Secret Manager like the other secrets in this file, and deploy a
+   new revision (adding an env var in the console alone doesn't take
+   effect until a revision actually redeploys)
+
+See "Geocoding key gotchas" under Known Gotchas below before
+troubleshooting a failure here — this setup has a specific, repeatable
+failure mode worth reading first.
+
+---
+
 ## Order notifications — WhatsApp, Telegram, email
 
 ### WhatsApp (Green-API)
@@ -498,6 +577,52 @@ silently reads as zero again despite correct-looking dashboard
 settings, check this doc name mismatch first, ideally via a direct
 Firestore read rather than trusting the console's visual match — two
 Firestore docs with similar names are easy to eyeball as "the same."
+
+### Geocoding key gotchas — three separate real failures, in order
+Setting up `GOOGLE_GEOCODING_API_KEY` hit three distinct, genuinely
+separate problems in production, each producing the exact same
+symptom ("The provided API key is invalid.") — worth knowing all
+three, since fixing one doesn't rule out the others:
+
+1. **Using the wrong key entirely.** The Maps JavaScript API key
+   (client-side, HTTP-referrer-restricted, lives in `App.jsx`) and the
+   Geocoding key (server-side, unrestricted) are **two separate keys**
+   by necessity — a referrer restriction only means anything for a
+   real browser request; Google flatly rejects a referrer-restricted
+   key on any server-to-server call with `"API keys with referer
+   restrictions cannot be used with this API."` If you only ever
+   created one key, this is almost certainly it.
+2. **Env var name mismatch.** The value can be perfect and the code
+   still won't find it — `GOOGLE_GEOCODING_API_KEY` must match
+   *exactly*. A Cloud Run env var accidentally named
+   `GOOGLE_GEOCODING_NORESTRICT_API_KEY` (a very reasonable name to
+   type by hand, and completely invisible as wrong just by looking at
+   it) means `process.env.GOOGLE_GEOCODING_API_KEY` is simply
+   `undefined` — the code throws its own "Geocoding isn't configured
+   yet" error, not a Google API error at all.
+3. **A single mistyped/mis-pasted character.** `AIza...` is how every
+   real Google API key starts — capital A, capital I, lowercase z,
+   lowercase a. A key that instead reads `Alza...` (capital A,
+   **lowercase L**) is silently wrong and completely invisible to the
+   eye in most fonts, including Cloud Run's own console input field —
+   `I` and `l` render identically in a huge number of typefaces. This
+   happened after a legitimate copy from the Cloud Console.
+
+**How this was actually diagnosed** — worth reusing as a pattern for
+any "this secret isn't working" report: never trust reading a
+secret's value off a screenshot or a terminal by eye. Pull the *live*
+value programmatically and test *that* directly against the real API,
+with zero manual retyping anywhere in the chain:
+```bash
+KEY=$(gcloud run services describe wfa-pay-be --region=asia-southeast1 --format=json \
+  | python3 -c "import json,sys; d=json.load(sys.stdin); envs=d['spec']['template']['spec']['containers'][0]['env']; print(next((e['value'] for e in envs if e.get('name')=='GOOGLE_GEOCODING_API_KEY'), 'NOT_FOUND'))")
+curl -G "https://maps.googleapis.com/maps/api/geocode/json" \
+  --data-urlencode "address=some real address" \
+  --data-urlencode "key=$KEY"
+```
+A real Google API key is always exactly **39 characters** —
+`echo -n "$KEY" | wc -c` is a fast first sanity check before even
+hitting the network.
 
 ### Airwallex always shows "x 1" for single-quantity lines
 `order.products` lines without a `quantity` field (Service Charge,
