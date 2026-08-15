@@ -606,6 +606,22 @@ async function resolveEffectiveMenuForOutlet(outletId) {
 // that item is rejected outright — a mismatched cart is a sign
 // something's wrong (deleted item, tampered request), not something to
 // silently patch over and charge for anyway.
+// Server-side mirror of the frontend's summarizeModifiers() — modifier
+// selections are stored as one flat entry PER UNIT chosen (e.g. "3x
+// Malbec" is three separate {id, label, priceDelta} entries, exactly
+// what the frontend's quantity stepper sends), so this groups
+// duplicates back together for a readable summary ("Malbec ×3,
+// Cabernet ×5") saved directly on the order rather than recomputed
+// downstream by every consumer.
+function summarizeModifiers(modifiers) {
+  if (!modifiers || !modifiers.length) return "";
+  const counts = new Map();
+  for (const m of modifiers) counts.set(m.label, (counts.get(m.label) || 0) + 1);
+  return Array.from(counts.entries())
+    .map(([label, count]) => (count > 1 ? `${label} ×${count}` : label))
+    .join(", ");
+}
+
 async function computeVerifiedSubtotal(outletId, items) {
   const { menu } = await resolveEffectiveMenuForOutlet(outletId);
   let subtotal = 0;
@@ -637,16 +653,34 @@ async function computeVerifiedSubtotal(outletId, items) {
 
     let modifierTotal = 0;
     const realOptions = menuItem.modifierGroup?.options || [];
+    // Previously this loop only used realOptions to VALIDATE and PRICE
+    // each selection, then discarded which options were actually
+    // chosen — the saved order never recorded modifier selections at
+    // all, so Reports/Charts had nothing to show beyond the base item
+    // name. Now the real (server-verified — never the client-supplied
+    // label, only the id is trusted) selection is also collected, one
+    // entry per unit chosen exactly as the frontend's quantity stepper
+    // already sends it (e.g. "Malbec" picked 3 times arrives as 3
+    // separate {id} entries here).
+    const resolvedModifiers = [];
     for (const m of line.modifiers || []) {
       const realOption = realOptions.find((o) => o.id === m.id);
       if (!realOption) throw new Error(`Invalid option selected for "${menuItem.name}".`);
-      modifierTotal += Number(realOption.priceDelta) || 0;
+      const delta = Number(realOption.priceDelta) || 0;
+      modifierTotal += delta;
+      resolvedModifiers.push({ id: realOption.id, label: realOption.label, priceDelta: delta });
     }
+    // A ready-to-display summary ("Malbec ×3, Cabernet ×5") saved
+    // alongside the raw list — computed once here, server-side, so
+    // every consumer (Reports, Orders table, CSV export, Airwallex
+    // line items, notifications) can just use it directly rather than
+    // each re-implementing the same duplicate-grouping logic.
+    const modifierSummary = summarizeModifiers(resolvedModifiers);
 
     const unit = +(base + modifierTotal).toFixed(2);
     const lineTotal = +(unit * qty).toFixed(2);
     subtotal = +(subtotal + lineTotal).toFixed(2);
-    verifiedItems.push({ name: menuItem.name, qty, kind: line.kind, unitLabel, unit, lineTotal });
+    verifiedItems.push({ name: menuItem.name, qty, kind: line.kind, unitLabel, unit, lineTotal, modifiers: resolvedModifiers, modifierSummary });
   }
 
   return { subtotal, verifiedItems };
@@ -768,7 +802,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     // is ever sent. If it doesn't match finalAmount exactly, checkout is
     // refused rather than risking a silent under/overcharge.
     const orderProducts = verifiedItems.map((i) => ({
-      name: `${i.name} (${i.unitLabel})`.slice(0, 255),
+      name: `${i.name}${i.modifierSummary ? ` — ${i.modifierSummary}` : ""} (${i.unitLabel})`.slice(0, 255),
       unit_price: i.unit,
       quantity: i.qty,
     }));
@@ -804,7 +838,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
           customerName: customer?.name || "",
           customerEmail: customer?.email || "",
           customerPhone: customer?.phone || "",
-          items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.unitLabel})`).join(", ").slice(0, 500),
+          items: verifiedItems.map((i) => `${i.qty}x ${i.name}${i.modifierSummary ? ` — ${i.modifierSummary}` : ""} (${i.unitLabel})`).join(", ").slice(0, 500),
           memberDiscountApplied: discountApplied ? "1" : "0",
         },
       }),
@@ -1033,7 +1067,7 @@ app.post("/pos/complete-order", requireAuth, validateBody(posCompleteOrderSchema
         table: table ? String(table) : "",
         outlet: String(outlet),
         customerEmail: customer?.email || "",
-        items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.unitLabel})`).join(", ").slice(0, 500),
+        items: verifiedItems.map((i) => `${i.qty}x ${i.name}${i.modifierSummary ? ` — ${i.modifierSummary}` : ""} (${i.unitLabel})`).join(", ").slice(0, 500),
       },
       sessionId: id,
     });
