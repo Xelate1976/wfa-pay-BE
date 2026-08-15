@@ -1641,6 +1641,54 @@ async function notifyOnPayment({ amountCents, metadata, sessionId }) {
 app.get("/", (_req, res) => res.send("WFA Asia payments backend is running."));
 
 /* ---------------------------------------------------------------------
+   Geocoding — converts an outlet's address into lat/lng coordinates,
+   used by the merchant dashboard's Sales Map (Reports → Map). This is
+   deliberately a SEPARATE key from whatever renders the map itself in
+   the browser: this one calls Google's Geocoding API server-side and
+   is never sent to the client, so it can be a plain unrestricted key
+   (kept in Secret Manager like the other secrets in this file) rather
+   than needing HTTP-referrer restriction the way a client-exposed
+   Maps JavaScript API key does.
+
+   Called once per outlet, only when a merchant actually enters/changes
+   an address — NOT on every dashboard load — so this stays well within
+   Google's free monthly tier (10,000 Geocoding requests/month as of
+   the March 2025 pricing restructure) for any realistic number of
+   outlets.
+--------------------------------------------------------------------- */
+async function geocodeAddress(address) {
+  const apiKey = process.env.GOOGLE_GEOCODING_API_KEY;
+  if (!apiKey) {
+    throw new Error("Geocoding isn't configured yet — set GOOGLE_GEOCODING_API_KEY on the backend (see README).");
+  }
+  const url = `https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(address)}&key=${apiKey}`;
+  const res = await fetch(url);
+  const data = await res.json().catch(() => ({}));
+  if (data.status !== "OK" || !data.results?.length) {
+    const reason = data.status === "ZERO_RESULTS" ? "Couldn't find that address — try adding more detail (unit, street, city)." : (data.error_message || `Geocoding failed (${data.status || "no response"}).`);
+    throw new Error(reason);
+  }
+  const result = data.results[0];
+  return {
+    lat: result.geometry.location.lat,
+    lng: result.geometry.location.lng,
+    formattedAddress: result.formatted_address,
+  };
+}
+
+app.post("/outlets/geocode", requireAuth, async (req, res) => {
+  try {
+    const address = (req.body?.address || "").trim();
+    if (!address) return res.status(400).json({ error: "address is required." });
+    const result = await geocodeAddress(address);
+    res.json(result);
+  } catch (e) {
+    console.error("outlets/geocode failed:", e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+/* ---------------------------------------------------------------------
    File uploads — menu photos and ad banners (images/GIFs/video) go here
    instead of into Firestore directly. The frontend converts a picked
    file to base64 and POSTs it here; this saves it to Cloud Storage and
