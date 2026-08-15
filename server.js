@@ -621,7 +621,19 @@ async function computeVerifiedSubtotal(outletId, items) {
     if (menuItem.active === false) throw new Error(`"${menuItem.name}" is currently unavailable.`);
 
     const base = line.kind === "bottle" ? menuItem.bottle : menuItem.glass;
-    if (!Number.isFinite(base)) throw new Error(`"${menuItem.name}" has no valid ${line.kind} price.`);
+    // The menu item's actual custom name for this price slot (e.g. "Can",
+    // "Tower") — falls back to "Glass"/"Bottle" for items saved before
+    // this field existed. `kind` itself stays the fixed internal
+    // "glass"/"bottle" identifier everywhere (unchanged pricing logic,
+    // unchanged Zod schema) — unitLabel is purely what a human should
+    // see, resolved once here and carried through checkout, POS,
+    // Airwallex's line-item breakdown, notifications, and the order
+    // record actually saved to Firestore. This is what lets historical
+    // orders/reports show a merchant's real naming instead of always
+    // "Glass"/"Bottle", without needing a live menu lookup later (the
+    // menu item may since have been renamed or deleted).
+    const unitLabel = line.kind === "bottle" ? (menuItem.bottleLabel || "Bottle") : (menuItem.glassLabel || "Glass");
+    if (!Number.isFinite(base)) throw new Error(`"${menuItem.name}" has no valid ${unitLabel} price.`);
 
     let modifierTotal = 0;
     const realOptions = menuItem.modifierGroup?.options || [];
@@ -634,7 +646,7 @@ async function computeVerifiedSubtotal(outletId, items) {
     const unit = +(base + modifierTotal).toFixed(2);
     const lineTotal = +(unit * qty).toFixed(2);
     subtotal = +(subtotal + lineTotal).toFixed(2);
-    verifiedItems.push({ name: menuItem.name, qty, kind: line.kind, unit, lineTotal });
+    verifiedItems.push({ name: menuItem.name, qty, kind: line.kind, unitLabel, unit, lineTotal });
   }
 
   return { subtotal, verifiedItems };
@@ -756,7 +768,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
     // is ever sent. If it doesn't match finalAmount exactly, checkout is
     // refused rather than risking a silent under/overcharge.
     const orderProducts = verifiedItems.map((i) => ({
-      name: `${i.name} (${i.kind})`.slice(0, 255),
+      name: `${i.name} (${i.unitLabel})`.slice(0, 255),
       unit_price: i.unit,
       quantity: i.qty,
     }));
@@ -792,7 +804,7 @@ app.post("/create-checkout-session", validateBody(createCheckoutSessionSchema), 
           customerName: customer?.name || "",
           customerEmail: customer?.email || "",
           customerPhone: customer?.phone || "",
-          items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+          items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.unitLabel})`).join(", ").slice(0, 500),
           memberDiscountApplied: discountApplied ? "1" : "0",
         },
       }),
@@ -1021,7 +1033,7 @@ app.post("/pos/complete-order", requireAuth, validateBody(posCompleteOrderSchema
         table: table ? String(table) : "",
         outlet: String(outlet),
         customerEmail: customer?.email || "",
-        items: items.map((i) => `${i.qty}x ${i.name} (${i.kind})`).join(", ").slice(0, 500),
+        items: verifiedItems.map((i) => `${i.qty}x ${i.name} (${i.unitLabel})`).join(", ").slice(0, 500),
       },
       sessionId: id,
     });
